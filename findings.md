@@ -458,6 +458,19 @@
 - 进一步去掉 demote summary 二次读后，r5 小矩阵结果在 `results/m3_14_packed_vs_per_layer_streaming_summary_r5/`：local_posix restore p50/p95/p99 为 `216.930/283.665/287.823ms`，packed_v1 为 `145.103/225.144/225.181ms`，packed restore p95 delta 为 `-58.521ms`，cold data files 从 `40` 降到 `10`，effective restore p50 从 `442.556MiB/s` 提升到 `526.998MiB/s`。
 - 按 token 拆分的 r5 结果：2K local/packed restore p95 为 `159.497ms` vs `66.766ms`；8K local/packed restore p95 为 `286.552ms` vs `225.169ms`。这说明 packed_v1 数据面优化后已具备继续做 8K/16K gate 的价值，但结论仍受本地 POSIX、synthetic qwen25 tiny profile、Python safetensors restore 和小样本抖动限制，不能外推为真实 3FS/生产 executor 性能。
 
+## 2026-05-28 M3.15 8K packed PrePass gate 发现
+- 本轮完成真实 Qwen2.5-14B、8192 prefix + 128 suffix + 1 output、`packed_v1` cold backend 的 PrePass gate。结果目录为 `results/m3_15_8k_packed_prepass_gate/`，研究报告为 `docs/research/m3_15_8k_packed_prepass_gate.md`。
+- 先发现并修复了一个重要实验有效性风险：首次 8K store 虽请求 `8192` tokens，但 connector 只保存 `2048` tokens、`128` blocks，manifest token range 是 `0..2048`。根因很可能是 vLLM 默认 `max_num_batched_tokens=2048` 导致 prefill chunk 暴露不完整。后续所有长上下文 store 必须校验 saved tokens。
+- 已在 `run_reuse_smoke_matrix.py` 中增加 guard：demote 后记录 `cold_saved_tokens`、`cold_expected_prefix_tokens`、`cold_saved_token_mismatch`；如果保存 token 数和请求 prefix 不一致，矩阵行直接标为错误。新增测试覆盖该场景。
+- 使用 `--max-model-len 16384 --max-num-batched-tokens 16384` 重跑后，8K store 有效：manifest token range 为 `0..8192`，connector 每层 `tokens=8192`、`block_count=512`，`cold_saved_token_mismatch=no`。
+- store 阶段写出 `48` 个 layer，connector store 求和 `3203.352ms`，请求 TTFT `5513.874ms`。demote 后冷区只有 `packed_object.bin` 和 `packed_manifest.json`，packed object 大小 `1610616960` bytes，hot per-layer files 被移除。
+- reuse 阶段采用 `store -> packed demote -> restart vLLM -> /prepass -> advance restore -> reuse`。PrePass 将 required historical range 分类为 `SSD_COLD`，状态 `QUEUED`，耗时 `25.280ms`，入队 `1610616960` bytes restore。
+- `/prefetch/advance` 完成真实 packed restore：`cold_restore_status=COMPLETED`，checksum `ok`，executor elapsed `3046.794ms`，advance elapsed `3061.115ms`。随后在线请求为 `ADMIT/required_kv_ready_before_decode`，`ready_barrier_all_ready=true`，`sync_ssd_miss_total=0`。
+- 在线 reuse 侧观测到 `external_load_observed=yes`、`load_events=1`、`store_events=0`、connector load `469.372ms`，online TTFT `710.835ms`。这说明 8K 的 external KV load path 真实触发，且没有复用阶段写回污染。
+- 需要谨慎解释：该样本证明 8K packed Anti-Caching 语义链路成立，但性能尚未达终局。若 restore 已被提前窗口隐藏，online TTFT 为 `710.835ms`；若从 PrePass 开始计入，restore-inclusive 为 `25.280 + 3061.115 + 710.835 = 3797.230ms`，主要由 packed restore executor 支配。
+- 与 M3.13 planner 相比，实际 8K restore executor `3046.794ms` 低于先前保守 required lead 估计 `4291.113ms`，说明 5s lead 在本机样本上有机会隐藏 restore。但进入 16K/32K 前必须补同配置 8K B0/B2 baseline，并继续优化 restore/load 数据面。
+- 下一步优先级应调整为：同配置 8K B0/B2 baseline、512/2K/8K compact packed PrePass matrix、packed restore/load 归因优化。直接冲 32K 信息增益不高，容易把 baseline 差异、restore executor、connector load 和 chunked prefill 问题混在一起。
+
 ## 视觉/浏览器发现
 - 本轮尚未使用视觉或浏览器资料。
 

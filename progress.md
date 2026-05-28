@@ -1646,3 +1646,38 @@
   - `pytest tests/m3/test_packed_cold_object.py::test_packed_adapter_builds_manifest_checksum_from_extent_metadata -q`：先红灯命中 packed object 二次读，修复后 `1 passed in 1.20s`。
   - `pytest tests/m3/test_packed_cold_object.py tests/m3/test_packed_vs_per_layer_bench.py tests/m3/test_cold_tier_adapter_bench.py -q`：`12 passed in 3.95s`。
   - `python -m py_compile benchmarks/m3/cold_tier.py benchmarks/m3/run_packed_vs_per_layer_bench.py`：通过。
+
+### 阶段 M3.15-A：8K packed PrePass gate
+- **状态：** complete
+- 时间：2026-05-28T04:49:08Z
+- 执行的操作：
+  - 继续规划中的下一步：将优化后的 `packed_v1` cold object 接入真实 8K PrePass/reuse gate。
+  - 恢复并确认 vLLM store 服务配置：`--max-model-len 16384 --max-num-batched-tokens 16384`，避免默认 chunked prefill 只暴露 2048 tokens。
+  - 启动 sidecar，配置 `--cold-backend packed_v1 --async-prefetch`，保留 tensor store 与 cold root。
+  - 运行 8K store 阶段：`prefix_tokens=8192`、`suffix_tokens=128`、`output_tokens=1`、`--cold-tier-restore`。
+  - 校验 store 有效性：manifest token range 为 `0..8192`，connector 事件中每层 `tokens=8192`、`block_count=512`，packed object 大小 `1610616960` bytes，`cold_saved_token_mismatch=no`。
+  - 重启 vLLM 清空内置 prefix cache，保留 sidecar 和 cold object 状态。
+  - 运行 8K reuse 阶段：`--prepass-before-reuse --cold-backend packed_v1 --cold-tier-restore`。
+  - 写入研究报告 `docs/research/m3_15_8k_packed_prepass_gate.md`，并更新 `task_plan.md`、`findings.md`。
+- 关键结果：
+  - store 阶段：TTFT `5513.874ms`，connector store 求和 `3203.352ms`，`store_events=48`。
+  - cold object：`packed_v1`，`1610616960` bytes，冷区仅 `packed_object.bin` + `packed_manifest.json`，hot per-layer files demote 后不存在。
+  - PrePass：状态 `QUEUED`，耗时 `25.280ms`，枚举出 `SSD_COLD` required range 并入队 `1610616960` bytes restore。
+  - restore：`cold_restore_status=COMPLETED`，checksum `ok`，executor `3046.794ms`，advance `3061.115ms`。
+  - online reuse：`ADMIT/required_kv_ready_before_decode`，`ready_barrier_all_ready=true`，`sync_ssd_miss_total=0`，`external_load_observed=yes`，`load_events=1`，`store_events=0`，connector load `469.372ms`，online TTFT `710.835ms`。
+  - restore-inclusive 口径：`prepass_elapsed + cold_advance + online_ttft = 3797.230ms`。该结果证明 8K packed PrePass 语义链路成立，但不能声称端到端 SLA 已满足。
+- 修改文件：
+  - `benchmarks/m3/run_reuse_smoke_matrix.py`
+  - `tests/m3/test_reuse_smoke_matrix.py`
+  - `docs/research/m3_15_8k_packed_prepass_gate.md`
+  - `task_plan.md`
+  - `findings.md`
+  - `progress.md`
+- 下一步：
+  - 补同配置 8K B0/B2 baseline。
+  - 跑 512/2K/8K compact packed PrePass matrix。
+  - 继续优化 packed restore/load 数据面，尤其是 8K `3046.794ms` restore executor 与 `469.372ms` connector load。
+- 验证：
+  - `pytest tests/m3/test_reuse_smoke_matrix.py tests/m3/test_packed_cold_object.py -q`：`24 passed in 3.11s`。
+  - `python -m py_compile benchmarks/m3/run_reuse_smoke_matrix.py benchmarks/m3/cold_tier.py`：通过。
+  - `git diff --check`：通过。

@@ -4,7 +4,7 @@
 充分理解 `1M_Tokens_KV_Cache_分层管理技术方案.md` 的研究问题、系统架构、关键机制与实现约束，并产出可沟通、可迭代的实施规划。
 
 ## 当前阶段
-阶段 M3.14 正在推进：项目主线已重新收敛为 **Persistent KV Anti-Caching for Multi-Turn Long-Context Serving**。M3.12 已经证明真实 vLLM + true cold object + PrePass 可以把 cold restore 移出在线请求路径，M3.13 已经量化了不同 prefix 长度所需的 restore lead time。当前必须先修正三级存储语义：HBM 是 `GPU_READY` 执行层，CPU/DRAM 是 `CPU_READY` 准备层，SSD/3FS 是 `SSD_COLD` 冷区和持久化层。M3.14 要把系统从“能预取一个 cold manifest”升级为“有内存常驻 KV 状态索引 + 打包式冷 KV 对象 + 明确 SSD->CPU restore 与 CPU->GPU load 边界”的真正 Anti-Caching 结构。真实 3FS executor 仍属于 P1，不能替代 P0 的三级状态索引与 Packed Cold Object 证据链。
+阶段 M3.15 正在推进：项目主线已重新收敛为 **Persistent KV Anti-Caching for Multi-Turn Long-Context Serving**。M3.12 已经证明真实 vLLM + true cold object + PrePass 可以把 cold restore 移出在线请求路径，M3.13 已经量化了不同 prefix 长度所需的 restore lead time，M3.14 已完成三级 KV 状态索引与 `packed_v1` 冷对象数据面优化。最新 8K packed PrePass gate 已证明真实 8192-token packed cold object 可以通过 `SSD_COLD -> restore -> online external load` 跑通，但 restore executor 仍约 3.05s，restore-inclusive 约 3.80s。当前 P0 要转向“8K/16K 可解释性能证据”：补同配置 8K baseline，压低 packed restore/load 数据面，并在进入 16K/32K 前明确 CPU_READY 到 GPU_READY 的调度边界。
 
 ## 当前优先级把关
 
@@ -19,6 +19,8 @@
 | P0 | M3.14-B PrePass 分类集合 | PrePass 必须返回 gpu_ready/cpu_ready/ssd_cold/fetching/loading/missing/mismatch sets，而不是只返回计数和 QUEUED/READY |
 | P0 | M3.14-B2 CPU->GPU load readiness 边界 | CPU_READY 不等于 GPU_READY；必须显式建模 H2D load 预算，否则会低估在线 TTFT/Decode ready 风险 |
 | P0 | M3.14-C Packed Cold Object / extent layout | 对应 Anti-Cache Block Table；每层小文件无法支撑 32K/128K/1M，也无法与 KVDrive/3FS 做严肃对比 |
+| P0 | M3.15 8K packed PrePass gate 与同配置 baseline | 8K 链路已跑通，但必须用同一 vLLM 配置对比 B0/B2，才能判断 online TTFT 和 restore-inclusive 的实际收益 |
+| P0 | M3.15 packed restore/load 数据面继续优化 | 8K restore executor 约 3.05s、connector load 约 469ms，是进入 16K 前必须解释和压低的关键路径 |
 | P1 | 生产级 restore executor：QD、pinned staging、H2D overlap、tail metrics | P0 证明有收益后，才值得优化真实数据面 |
 | P1 | 真实 3FS mount / 生产 SSD 校准 | 重要，但应服务于已被 P0 证明的系统路径 |
 | P1 | Partial promote + attention-informed hotness sketch | 强化 Anti-Caching 策略，吸收 KVDrive 启发，但不是第一证明点 |
@@ -235,6 +237,18 @@
 - [ ] 在 packed restore 优化或 8K 结果稳定后，再回到 M3.13 的 16K/32K gate matrix
 - **状态：** in_progress
 
+### 阶段 M3.15：8K Packed PrePass Gate 与性能归因
+- [x] 修复 8K store 静默截断风险：`run_reuse_smoke_matrix.py` 在 demote 后记录 `cold_saved_tokens`、`cold_expected_prefix_tokens` 和 `cold_saved_token_mismatch`
+- [x] 使用 `--max-num-batched-tokens 16384` 重跑 8K store，确认 connector 保存 `8192` tokens、`512` blocks、`48` layers
+- [x] 生成真实 `packed_v1` cold object：`1610616960` bytes，冷区仅保留 `packed_object.bin` 与 `packed_manifest.json`
+- [x] 重启 vLLM 后运行 8K `--prepass-before-reuse`，验证 `SSD_COLD -> packed restore -> ADMIT -> external load`
+- [x] 输出研究报告 `docs/research/m3_15_8k_packed_prepass_gate.md`
+- [ ] 补同配置 8K B0/B2 baseline：同样使用 `--max-model-len 16384 --max-num-batched-tokens 16384`
+- [ ] 跑 512/2K/8K compact packed PrePass matrix，复核 restore scaling 和 token-mismatch guard
+- [ ] 优化 packed restore/load 数据面，降低 8K restore executor 与 connector load 时间
+- [ ] 在 8K baseline 与数据面归因完成后，再进入 16K gate
+- **状态：** in_progress
+
 ### 研究阶段 R2：KV Anti-Caching 方案深化
 - [x] 复盘 Tutti 未覆盖的调度与系统语义问题
 - [x] 将数据库 Anti-Caching 的 pre-pass、Evicted Table、Block Table、tuple-merge 等机制映射到 KV 管理
@@ -305,6 +319,8 @@
 | SSD 不是慢主存，而是冷区和持久化层 | SSD 上的 KV 永远不是 ready；只有恢复到 CPU/HBM 并校验后，才允许 vLLM connector 加载 |
 | M3.14-B2 修正 ready/cold 语义为三级状态 | `CPU_READY` 只表示 SSD->CPU restore 已完成，不表示 decode 可直接执行；`GPU_READY` 才是 HBM 执行 ready；`LOADING` 用于表示 CPU->GPU load 进行中 |
 | M3.14-E 修正 packed_v1 数据面后，packed layout 可以继续进入 8K/16K gate | 初始 packed_v1 虽减少文件数但 restore 明显变慢；streaming restore、fast manifest summarize、demote summary 不再重读 packed object 后，r5 2K/8K 小矩阵中 packed restore p95 比 per-layer 低约 58.521ms，冷区数据文件数从 40 降到 10。但这仍是 local POSIX + qwen25 tiny profile，不是 3FS/生产结论 |
+| 8K packed PrePass gate 必须校验实际保存 token 数 | 首次 8K 尝试因 vLLM chunked prefill/scheduler token budget 只保存 2048 tokens；后续长上下文 store 必须要求 `cold_saved_tokens == requested_prefix_tokens`，否则样本无效 |
+| M3.15 8K packed PrePass 链路成立但还不是性能终局 | 当前 8K 样本 online TTFT 为 710.835ms、restore executor 为 3046.794ms、restore-inclusive 为 3797.230ms；说明 PrePass 可以隐藏 restore，但若提前量不足仍不满足严格 SLA |
 
 ## 遇到的错误
 | 错误 | 尝试次数 | 解决方案 |
@@ -342,6 +358,7 @@
 | B3 初始服务在后台 shell 退出后端口关闭 | 1 | 改用持久执行会话分别管理 vLLM 和 sidecar 生命周期 |
 | B5 首次 2K store 阶段未带 `--cold-tier-restore`，导致没有真实 demote 到 cold tier | 1 | 保留原目录作为不完整样本，另起 `b5_anti_caching_true` 干净重跑 store+demote+mark-cold+restart+restore |
 | 本机缺少 `column` 命令 | 1 | 改用 `sed` 查看 CSV 原始内容；后续脚本和报告不依赖 `column` |
+| 8K store 首次只保存 2048 tokens 而不是 8192 tokens | 1 | 增加 `cold_saved_token_mismatch` guard，并用 `--max-num-batched-tokens 16384` 重跑有效 8K 样本 |
 
 ## 备注
 - `task_plan.md` 记录阶段和决策。

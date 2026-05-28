@@ -158,7 +158,11 @@ def _run_online_row(config: MatrixConfig, row: MatrixRow) -> dict[str, Any]:
                 first_elapsed_ms = _elapsed_ms(first_started)
                 if config.cold_tier_restore:
                     cold_summary.update(
-                        demote_prefix_to_cold_object(config, prefix_id)
+                        demote_prefix_to_cold_object(
+                            config,
+                            prefix_id,
+                            expected_prefix_tokens=row.prefix_tokens,
+                        )
                     )
                     cold_summary.update(
                         mark_sidecar_prefix_cold(
@@ -282,6 +286,15 @@ def _run_online_row(config: MatrixConfig, row: MatrixRow) -> dict[str, Any]:
         ),
     )
     success = _response_success(first) and _response_success(second)
+    if cold_summary.get("cold_saved_token_mismatch") == "yes":
+        success = False
+        mismatch_error = (
+            "saved KV tokens do not match requested prefix: "
+            f"saved={cold_summary.get('cold_saved_tokens')} "
+            f"expected={cold_summary.get('cold_expected_prefix_tokens')}"
+        )
+    else:
+        mismatch_error = ""
     return {
         "run_id": row.run_id,
         "prefix_tokens": row.prefix_tokens,
@@ -295,7 +308,7 @@ def _run_online_row(config: MatrixConfig, row: MatrixRow) -> dict[str, Any]:
         "second_ttft_ms": second_elapsed_ms,
         "reuse_tokens": row.prefix_tokens,
         **decision_summary,
-        "error": "" if success else _response_error(first, second),
+        "error": "" if success else (mismatch_error or _response_error(first, second)),
         "manifest_bytes": len(json.dumps(manifest, sort_keys=True)),
         **event_summary,
         **cold_summary,
@@ -354,6 +367,8 @@ def clone_payload_with_request_id(
 def demote_prefix_to_cold_object(
     config: MatrixConfig,
     prefix_id: str,
+    *,
+    expected_prefix_tokens: int | None = None,
 ) -> dict[str, Any]:
     if config.tensor_store is None:
         raise ValueError("--tensor-store is required for cold-tier restore mode")
@@ -363,6 +378,12 @@ def demote_prefix_to_cold_object(
         prefix_id,
         cold_adapter=build_cold_tier_adapter(config.cold_backend, cold_root),
         tier="NVME",
+    )
+    saved_tokens = int(manifest.tokens)
+    expected_tokens = (
+        int(expected_prefix_tokens)
+        if expected_prefix_tokens is not None
+        else _expected_prefix_tokens_from_config(config, prefix_id)
     )
     hot_files_present = all(
         (config.tensor_store / prefix_id / record.file_name).exists()
@@ -376,7 +397,19 @@ def demote_prefix_to_cold_object(
         "cold_checksum": manifest.checksum,
         "cold_backend": config.cold_backend,
         "cold_hot_files_present_after_demote": "yes" if hot_files_present else "no",
+        "cold_saved_tokens": saved_tokens,
+        "cold_expected_prefix_tokens": expected_tokens,
+        "cold_saved_token_mismatch": (
+            "yes" if expected_tokens and saved_tokens != expected_tokens else "no"
+        ),
     }
+
+
+def _expected_prefix_tokens_from_config(config: MatrixConfig, prefix_id: str) -> int:
+    for row in matrix_rows(config):
+        if f"m3-8-{row.prefix_tokens}" == prefix_id:
+            return int(row.prefix_tokens)
+    return 0
 
 
 def mark_sidecar_prefix_cold(
@@ -653,6 +686,9 @@ def empty_cold_tier_summary() -> dict[str, Any]:
         "cold_checksum": "",
         "cold_backend": "",
         "cold_hot_files_present_after_demote": "",
+        "cold_saved_tokens": "",
+        "cold_expected_prefix_tokens": "",
+        "cold_saved_token_mismatch": "",
         "cold_commit_status_code": "",
         "cold_commit_status": "",
         "cold_probe_status_code": "",
@@ -805,6 +841,9 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "cold_checksum",
         "cold_backend",
         "cold_hot_files_present_after_demote",
+        "cold_saved_tokens",
+        "cold_expected_prefix_tokens",
+        "cold_saved_token_mismatch",
         "cold_commit_status_code",
         "cold_commit_status",
         "cold_probe_status_code",

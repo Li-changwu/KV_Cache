@@ -365,6 +365,42 @@ def test_demote_prefix_to_cold_object_removes_hot_files(tmp_path):
     assert not (tensor_store / "m3-8-16" / "layer.0.safetensors").exists()
 
 
+def test_demote_prefix_to_cold_object_reports_saved_tokens(tmp_path):
+    tensor_store = tmp_path / "tensor_store"
+    store = KVTensorStore(tensor_store, block_size=16)
+    source = torch.arange(2 * 2 * 16 * 1 * 1, dtype=torch.float32).reshape(
+        2, 2, 16, 1, 1
+    )
+    store.save_layer(
+        prefix_id="m3-8-64",
+        token_start=0,
+        token_end=16,
+        correctness_key={"model_fingerprint": "model"},
+        token_ids=list(range(16)),
+        layer_name="layer.0",
+        kv_layer=source,
+        slot_mapping=block_slot_mapping([1], block_size=16, num_tokens=16),
+        layout="NHD",
+    )
+
+    summary = demote_prefix_to_cold_object(
+        MatrixConfig(
+            prefix_tokens=[64],
+            suffix_tokens=16,
+            output_tokens=1,
+            result_dir=tmp_path / "result",
+            tensor_store=tensor_store,
+            cold_root=tmp_path / "cold",
+            cold_tier_restore=True,
+        ),
+        "m3-8-64",
+    )
+
+    assert summary["cold_saved_tokens"] == 16
+    assert summary["cold_expected_prefix_tokens"] == 64
+    assert summary["cold_saved_token_mismatch"] == "yes"
+
+
 def test_demote_prefix_to_cold_object_can_use_3fs_posix_backend(tmp_path):
     tensor_store = tmp_path / "tensor_store"
     store = KVTensorStore(tensor_store, block_size=16)
