@@ -1,6 +1,7 @@
 from pathlib import Path
 import subprocess
 import sys
+import json
 
 import torch
 from fastapi.testclient import TestClient
@@ -21,6 +22,8 @@ from benchmarks.m3.run_reuse_smoke_matrix import (
     summarize_sidecar_decision_delta,
     summarize_connector_events,
     summarize_sidecar_metric_deltas,
+    load_workload_manifest_rows,
+    resolve_prefix_id_for_row,
 )
 from benchmarks.m3.tensor_store import KVTensorStore, block_slot_mapping
 
@@ -298,6 +301,90 @@ def test_online_payloads_use_same_prefix_id_for_store_and_reuse():
     assert len(reuse_payload["prompt"].split()) == 80
     assert reuse_control["prefix_candidates"][0]["prefix_id"] == "m3-8-64"
     assert reuse_control["prefix_candidates"][0]["token_end"] == 64
+
+
+def test_online_payloads_can_use_longmemeval_workload_manifest(tmp_path):
+    manifest_path = tmp_path / "longmemeval_workload.jsonl"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "m3_prefix_id": "lme-q1-p24",
+                "prefix_prompt": "history prefix",
+                "suffix_prompt": "current question",
+                "reuse_prompt": "history prefix\ncurrent question",
+                "actual_prefix_tokens": 24,
+                "suffix_tokens": 4,
+                "question_id": "q1",
+                "dataset_split": "longmemeval_s_cleaned",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config = MatrixConfig(
+        prefix_tokens=[24],
+        suffix_tokens=4,
+        output_tokens=1,
+        result_dir=tmp_path / "result",
+        workload_manifest=manifest_path,
+    )
+    row = matrix_rows(config)[0]
+
+    store_payload, reuse_payload = build_store_and_reuse_payloads(config, row)
+
+    assert store_payload["prompt"] == "history prefix"
+    assert reuse_payload["prompt"] == "history prefix\ncurrent question"
+    assert store_payload["m3_control"]["store_prefix_id"] == "lme-q1-p24"
+    assert store_payload["m3_control"]["token_count"] == 24
+    assert reuse_payload["m3_control"]["token_count"] == 28
+    assert reuse_payload["m3_control"]["prefix_candidates"][0]["prefix_id"] == "lme-q1-p24"
+    assert reuse_payload["m3_control"]["prefix_candidates"][0]["token_end"] == 24
+
+
+def test_online_cold_tier_uses_workload_manifest_prefix_id(tmp_path):
+    manifest_path = tmp_path / "longmemeval_workload.jsonl"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "m3_prefix_id": "lme-q1-p24",
+                "prefix_prompt": "history prefix",
+                "reuse_prompt": "history prefix\ncurrent question",
+                "actual_prefix_tokens": 24,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config = MatrixConfig(
+        prefix_tokens=[24],
+        suffix_tokens=4,
+        output_tokens=1,
+        result_dir=tmp_path / "result",
+        workload_manifest=manifest_path,
+        cold_tier_restore=True,
+    )
+    row = matrix_rows(config)[0]
+
+    assert resolve_prefix_id_for_row(config, row) == "lme-q1-p24"
+
+
+def test_load_workload_manifest_rows_selects_requested_prefix(tmp_path):
+    manifest_path = tmp_path / "longmemeval_workload.jsonl"
+    manifest_path.write_text(
+        "\n".join(
+            [
+                json.dumps({"m3_prefix_id": "lme-q1-p24", "actual_prefix_tokens": 24}),
+                json.dumps({"m3_prefix_id": "lme-q1-p48", "actual_prefix_tokens": 48}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    rows = load_workload_manifest_rows(manifest_path, prefix_tokens=[48])
+
+    assert list(rows) == [48]
+    assert rows[48]["m3_prefix_id"] == "lme-q1-p48"
 
 
 def test_clone_payload_with_request_id_preserves_original_payload():

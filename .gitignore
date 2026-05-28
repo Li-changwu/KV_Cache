@@ -26,6 +26,7 @@ id_ed25519*
 secrets.*
 
 # Experiment outputs and generated artifacts
+data/
 results/
 runs/
 artifacts/

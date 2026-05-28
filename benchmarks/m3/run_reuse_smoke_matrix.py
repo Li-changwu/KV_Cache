@@ -49,6 +49,7 @@ class MatrixConfig:
     prepass_before_reuse: bool = False
     advance_ms: float = 12_000.0
     block_size: int = 16
+    workload_manifest: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -126,7 +127,7 @@ def _dry_run_row(row: MatrixRow, phase: str = "both") -> dict[str, Any]:
 
 
 def _run_online_row(config: MatrixConfig, row: MatrixRow) -> dict[str, Any]:
-    prefix_id = f"m3-8-{row.prefix_tokens}"
+    prefix_id = resolve_prefix_id_for_row(config, row)
     first_payload, second_payload = build_store_and_reuse_payloads(config, row)
     final_reuse_payload = second_payload
     cold_summary = {
@@ -320,11 +321,27 @@ def build_store_and_reuse_payloads(
     config: MatrixConfig,
     row: MatrixRow,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    prefix_id = f"m3-8-{row.prefix_tokens}"
-    prefix_prompt = _prompt_for_tokens(config.prompt_unit, row.prefix_tokens)
-    reuse_prompt = _prompt_for_tokens(
-        config.prompt_unit,
-        row.prefix_tokens + row.suffix_tokens,
+    workload_row = load_workload_manifest_rows(
+        config.workload_manifest,
+        prefix_tokens=config.prefix_tokens,
+    ).get(row.prefix_tokens)
+    prefix_id = (
+        str(workload_row.get("m3_prefix_id"))
+        if workload_row is not None and workload_row.get("m3_prefix_id")
+        else f"m3-8-{row.prefix_tokens}"
+    )
+    prefix_prompt = (
+        str(workload_row.get("prefix_prompt"))
+        if workload_row is not None and workload_row.get("prefix_prompt") is not None
+        else _prompt_for_tokens(config.prompt_unit, row.prefix_tokens)
+    )
+    reuse_prompt = (
+        str(workload_row.get("reuse_prompt"))
+        if workload_row is not None and workload_row.get("reuse_prompt") is not None
+        else _prompt_for_tokens(
+            config.prompt_unit,
+            row.prefix_tokens + row.suffix_tokens,
+        )
     )
     base = {
         "model": config.model,
@@ -352,6 +369,16 @@ def build_store_and_reuse_payloads(
     )
 
 
+def resolve_prefix_id_for_row(config: MatrixConfig, row: MatrixRow) -> str:
+    workload_row = load_workload_manifest_rows(
+        config.workload_manifest,
+        prefix_tokens=config.prefix_tokens,
+    ).get(row.prefix_tokens)
+    if workload_row is not None and workload_row.get("m3_prefix_id"):
+        return str(workload_row["m3_prefix_id"])
+    return f"m3-8-{row.prefix_tokens}"
+
+
 def clone_payload_with_request_id(
     payload: dict[str, Any],
     request_id: str,
@@ -362,6 +389,31 @@ def clone_payload_with_request_id(
         raise ValueError("payload has no m3_control object")
     control["request_id"] = request_id
     return cloned
+
+
+def load_workload_manifest_rows(
+    path: Path | None,
+    *,
+    prefix_tokens: list[int],
+) -> dict[int, dict[str, Any]]:
+    if path is None:
+        return {}
+    if not path.exists():
+        raise FileNotFoundError(f"workload manifest not found: {path}")
+    wanted = {int(item) for item in prefix_tokens}
+    selected: dict[int, dict[str, Any]] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        if not isinstance(record, dict):
+            continue
+        actual = int(record.get("actual_prefix_tokens") or 0)
+        target = int(record.get("target_prefix_tokens") or actual)
+        for key in (actual, target):
+            if key in wanted and key not in selected:
+                selected[key] = record
+    return selected
 
 
 def demote_prefix_to_cold_object(
@@ -935,6 +987,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--prepass-before-reuse", action="store_true")
     parser.add_argument("--advance-ms", type=float, default=12_000.0)
     parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument(
+        "--workload-manifest",
+        help="JSONL produced by longmemeval_workload.py; rows override synthetic prompts.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
 
@@ -965,6 +1021,9 @@ def main(argv: list[str] | None = None) -> int:
             prepass_before_reuse=args.prepass_before_reuse,
             advance_ms=args.advance_ms,
             block_size=args.block_size,
+            workload_manifest=Path(args.workload_manifest)
+            if args.workload_manifest
+            else None,
         )
     )
     print(json.dumps(result, indent=2, sort_keys=True))

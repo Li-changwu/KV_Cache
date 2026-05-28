@@ -476,8 +476,40 @@
 - 但 B5 packed PrePass restore-inclusive 为 `3797.230ms`，是 B0 的 `1.576176x`；瓶颈仍是 `3046.794ms` packed restore executor 和 `469.372ms` connector load。因此当前贡献应表述为“PrePass lead-time 下的 online TTFT 改善”，而不是“请求到达后同步恢复也满足 SLA”。
 - 产物包括 `results/m3_15_8k_baseline_same_config/b0_b2_b5_8k_comparison.md`、`b0_b2_b5_8k_comparison.csv` 和 `b0_b2_b5_8k_summary.json`。M3.15 研究报告已更新同配置 baseline 口径。
 
+## 2026-05-28 M3.15 2K/8K/16K packed PrePass 趋势发现
+- 按用户要求本轮不跑 512，直接补齐 2K 与 16K packed PrePass gate，并复用既有 8K 样本形成趋势表。新报告为 `docs/research/m3_15_2k16k_packed_prepass_trend.md`，汇总产物为 `results/m3_15_2k16k_trend/trend_summary.csv` 和 `trend_summary.json`。
+- 2K/16K 均使用真实路径：`store -> packed demote -> restart vLLM -> /prepass -> /prefetch/advance -> reuse`。2K 使用 `--max-model-len 16384 --max-num-batched-tokens 16384`；16K 使用 `--max-model-len 32768 --max-num-batched-tokens 32768`，避免 chunked prefill 再次截断保存 KV。
+- 2K 有效性：保存 `2048` tokens、`128` blocks、`48` layers，packed object `402657408` bytes，`cold_saved_token_mismatch=no`；reuse 阶段 `external_load_observed=yes`、`load_events=1`、`store_events=0`、`sync_ssd_miss_total=0`。
+- 16K 有效性：保存 `16384` tokens、`1024` blocks、`48` layers，packed object `3221229696` bytes，`cold_saved_token_mismatch=no`；reuse 阶段同样观测到外部 load、无写回污染、无同步 SSD miss。
+- 2K 结果：B0 TTFT `673.969ms`，B2 strict restart `689.483ms`，B5 online `301.511ms`，B5 online/B0 `0.447366x`；restore executor `823.925ms`，request-arrival restore-inclusive `1151.451ms`，restore-inclusive/B0 `1.708463x`。
+- 8K 结果：B0 TTFT `2409.141ms`，B2 `2418.796ms`，B5 online `710.835ms`，B5 online/B0 `0.295057x`；restore executor `3046.794ms`，request-arrival restore-inclusive `3797.230ms`，restore-inclusive/B0 `1.576176x`。
+- 16K 结果：B0 TTFT `5493.655ms`，B2 `5533.513ms`，B5 online `882.298ms`，B5 online/B0 `0.160603x`；restore executor `4581.719ms`，request-arrival restore-inclusive `5519.967ms`，restore-inclusive/B0 `1.004790x`。
+- 趋势判断：方向稳定。随着上下文从 2K 增至 16K，B5 online 相对 B0 的优势持续增强，说明如果 PrePass restore 能被工作流提前量隐藏，persistent KV Anti-Caching 的收益会随历史上下文增大而增强。
+- 谨慎判断：2K/8K 如果请求来了才开始 restore，仍明显慢于 B0；16K 的 request-arrival restore-inclusive 才接近打平 B0。这说明当前系统已经看到 break-even 拐点，但还不能声称任意长上下文下“同步恢复也满足 SLA”。
+- B2 在 2K/8K/16K 均接近 B0，说明 vLLM APC 跨进程重启不保留历史 KV，这继续支持 persistent KV 复用问题的必要性。
+- 新瓶颈：语义链路已经不是主问题，P0 应转向 packed restore executor 与 CPU-ready->GPU connector load。connector load 从 2K 的 `117.915ms` 增到 16K 的 `610.991ms`，已经占 online TTFT 的大部分；restore executor 仍是 request-arrival 口径的主导项。
+- 本轮启动 vLLM connector 时首次漏设 `PYTHONPATH=/root/KV`，导致 `ModuleNotFoundError: No module named 'benchmarks'`。该失败未纳入实验结果；后续 connector 版 vLLM 启动命令必须显式带 `PYTHONPATH=/root/KV`。
+
+## 2026-05-28 M3.16 LongMemEval workload 接入发现
+- LongMemEval cleaned 官方 Hugging Face dataset metadata 显示 license 为 MIT，包含 `longmemeval_s_cleaned.json`、`longmemeval_m_cleaned.json` 和 `longmemeval_oracle.json`。官方 README 说明 LongMemEval-S 拼接历史约 115K tokens，字段包括 `question_id`、`question_type`、`question`、`answer`、`question_date`、`haystack_session_ids`、`haystack_dates`、`haystack_sessions` 和 `answer_session_ids`。
+- LongMemEval 与本项目研究问题自然对齐：`haystack_sessions` 可作为可持久化、可复用的 historical KV prefix；当前 `question` 是在线 suffix；`answer` 和 evidence session 可作为未来语义正确性 sanity check，但 TTFT/restore 实验不依赖答案评测。
+- 已实现 `benchmarks/m3/longmemeval_workload.py`，输出 `longmemeval_workload.jsonl/csv/summary/report`。核心策略是保留最近历史 token 作为 prefix，并保留当前问题开头作为 suffix；默认用 Qwen2.5 tokenizer 计数，测试用 whitespace tokenizer 保持确定性。
+- `run_reuse_smoke_matrix.py` 已支持 `--workload-manifest`。这意味着现有 B5 packed PrePass/cold-tier 路径可以消费 LongMemEval 真实多轮文本 prompt，而不再只能用 synthetic `cache` token。
+- 当前已完成 fixture 级 dry-run：`results/m3_16_longmemeval_fixture/manifest/` 证明 adapter 能生成 manifest；`results/m3_16_longmemeval_fixture/reuse_dryrun/` 证明 reuse runner 能消费 manifest。这是接口验证，不是官方 LongMemEval-S 性能结果。
+- 官方数据下载在本轮网络条件下不稳定：S 文件约 277MB，oracle 约 15MB；`curl` 留下半截 JSON，`aria2c` 出现 TLS handshake failure，`datasets` streaming 长时间不返回。因此本轮未声称已完成官方 LongMemEval-S 真实 vLLM 结果。
+- 已补完整性检查，防止 partial JSON 被误用。后续拿到官方文件后，第一步应先运行 adapter manifest 命令，再用 1 个 2K 样本接入真实 store -> packed demote -> restart -> PrePass -> reuse path。
+
 ## 视觉/浏览器发现
 - 本轮尚未使用视觉或浏览器资料。
+
+## 2026-05-28 M3.17 论文初稿发现
+- 本轮将项目当前叙事收敛为英文系统论文草稿 `docs/paper/persistent_kv_anti_caching.md`，标题为 **Persistent KV Anti-Caching for Multi-Turn Long-Context LLM Serving**。草稿重点完成 Abstract、Introduction、Related Work 和 Design，按 CCF-A 系统论文风格写作，但保持 prototype 证据边界。
+- 论文核心问题被表述为：多轮长上下文服务中，历史 KV 是可复用的状态对象；HBM/DRAM 无法容纳所有历史 KV；SSD/3FS 只能作为 cold persistence tier；系统必须在请求进入 GPU 前 exact、可验证、可准入地恢复所需历史 KV，避免 cold miss 污染 Prefill/Decode critical path。
+- 核心方法被表述为数据库 Anti-Caching 到 KV serving 的迁移：KV Evicted Index 对应 Evicted Table，Packed Cold Object 对应 Block Table，KV PrePass 对应 pre-pass execution，DELAY/requeue/ready barrier 对应 abort/restart 前的非阻塞恢复语义。
+- Related Work 的关键边界：KVDrive 已经覆盖 GPU/DRAM/SSD holistic multi-tier KV 管理，因此本文不能泛泛声称“多级 KV 管理”是创新；我们的创新必须聚焦 persistent historical KV objects、correctness-keyed exact reuse、PrePass admission、ready barrier 和 no synchronous cold-tier miss。
+- 论文证据表 `docs/paper/evidence_table.md` 记录了当前可以支撑的结论：B5 online TTFT 在 synthetic 2K/8K/16K 中为 B0 的 `0.447x/0.295x/0.161x`；LongMemEval-S 单样本 2K/8K 为 `0.537x/0.297x`；但 restore-inclusive 在 2K/8K 仍高于 B0，不能声称请求到达后同步恢复满足 SLA。
+- 新增 `docs/paper/references.bib`，包含 Anti-Caching、PagedAttention、vLLM APC、LMCache、Mooncake、Tutti、KVDrive、CacheBlend 和 LongMemEval。当前引用以 arXiv/官方文档/PVLDB 信息为准，未声称 KVDrive 已被 SIGMOD 2026 收录。
+- 论文中明确保留当前缺口：尚无真实 3FS 集群性能、尚无强 baseline 全面对比、尚无 p95/p99 并发结果、尚未证明 admitted workload historical byte hit rate >=90%、尚未实现 1M 真实端到端服务。
 
 ---
 *每执行2次查看/浏览器/搜索操作后更新此文件。*

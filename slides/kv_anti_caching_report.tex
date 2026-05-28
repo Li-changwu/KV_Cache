@@ -10,6 +10,7 @@
 \usepackage{tikz}
 \usepackage{graphicx}
 \usepackage{array}
+\usepackage{colortbl}
 
 \usetikzlibrary{arrows.meta,positioning,fit}
 
@@ -39,248 +40,84 @@
 \textbf{\textcolor{MainBlue}{背景：Agent 与科学发现推理正在把上下文长度推到 1M tokens}}
 
 \vspace{0.2em}
-生产级长上下文推理不只是 ``prompt 更长''。精确 attention 要求历史 token 的 KV 状态在后续
-prefill / decode 中可被正确访问；上下文越长，KV 状态越像一个持续增长的服务状态，而不是一次性输入。
-
-\vspace{0.8em}
-
-\begin{columns}[T,onlytextwidth]
-\begin{column}{0.50\textwidth}
-\textbf{\textcolor{MainBlue}{现有执行层：HBM/DRAM 容量有限}}
-
-\vspace{0.2em}
-\footnotesize
-\begin{itemize}
-  \item Qwen2.5-14B 的 KV 约 192KiB/token；
-  \item 1M tokens 历史 KV 约 183GiB；
-  \item 单卡 HBM 无法把全部历史 KV 常驻为 execution-ready 状态。
-\end{itemize}
-\small
-\end{column}
-
-\begin{column}{0.48\textwidth}
-\textbf{\textcolor{MainBlue}{现有冷层：SSD/3FS 延迟不可透明隐藏}}
-
-\vspace{0.2em}
-\footnotesize
-\begin{itemize}
-  \item 3FS/SSD 可以提供容量，但不是 HBM；
-  \item Prefill reuse 遇到 cold miss 会等待 restore 或退化成历史重算，直接放大 TTFT；
-  \item Decode execution 才遇到 cold miss 会同步读冷层，放大 ITL 与尾延迟。
-\end{itemize}
-\small
-\end{column}
-\end{columns}
+生产级长上下文推理中，历史对话会在 prefill 阶段生成的 KV 状态，需要在后续多轮请求的 prefill 与 decode 中持续、准确地复用。随着上下文长度扩展到 128K 乃至 1M tokens，KV 已不再是单次请求的临时缓存，而是随会话、文档和工具轨迹持续增长的服务状态。
 
 \vspace{0.8em}
 
 \begin{beamercolorbox}[wd=\linewidth,sep=0.7em,rounded=true]{block body}
 \textbf{\textcolor{AccentRed}{核心问题：}}
-现有推理服务无法在\alert{精确 attention 语义}下，把百万级历史 KV 同时变成
-\alert{容量上可保存、Prefill 复用前可恢复、Decode 执行前必定 ready、且 TTFT 满足 SLA}的服务状态。
+% 当可复用 KV 状态的规模超过 GPU 显存容量时，现有前缀缓存和 KV 卸载机制难以有效支撑此类工作负载：推理引擎内的热缓存通常不具备跨会话持久性，而基于 SSD 的按需取回机制可能在 prefill 或 decode 的关键路径上引入阻塞。
+
+现有工作通过引擎内前缀缓存、外部 KV 存储以及基于 SSD 的数据搬移来改善 KV 复用，但它们仍然对一个关键的状态管理问题探索不足：当可复用的历史 KV 超出 GPU 显存时，冷 KV 对象虽然持久化保存，却并未处于可执行状态；若在预填充或解码阶段才去发现它，就可能将存储 I/O 转化为在线的尾部延迟。
 \end{beamercolorbox}
 
 \end{frame}
 
-\begin{frame}[t]{Observation: 1M KV 不是普通缓存扩容问题}
-\small
-\vspace{-0.55em}
+\begin{frame}[t]{Why it matters? }
+\vspace{0.35em}
 
-\begin{columns}[T,onlytextwidth]
-\begin{column}{0.54\textwidth}
-\begin{block}{KV 规模随上下文线性增长}
-\footnotesize
-\begin{tabularx}{\linewidth}{lrr}
-\toprule
-模型 / 场景 & 每 token KV & 1M tokens KV \\
-\midrule
-Qwen2.5-14B & 约 192KiB & 约 183GiB \\
-Qwen3-32B & 约 256KiB & 约 244GiB \\
-RTX A6000 HBM & -- & 约 48GiB \\
-\bottomrule
-\end{tabularx}
+\begin{block}{1、长上下文多轮对话正在成为 LLM 服务的重要形态}
+企业级 RAG、代码助手和多智能体工作流通常围绕文档、代码库、任务状态和历史交互持续展开，而不是一次性问答。因此，系统性能瓶颈不再只来自单次请求计算，也越来越来自如何高效承载和复用长历史上下文。
 \end{block}
-
-\vspace{0.25em}
-\begin{block}{本机实验给出的容量事实}
-\footnotesize
-\begin{itemize}
-  \setlength\itemsep{0.12em}
-  \item Qwen2.5-14B 可在单卡上原生跑到 32K，但不是 1M；
-  \item Qwen3-32B 需要 CPU offload 才能启动长上下文，极小请求 TTFT 已到秒级；
-  \item M2 仿真显示 low-locality 1M 请求不能进入快路径。
-\end{itemize}
-\end{block}
-\end{column}
-
-\begin{column}{0.44\textwidth}
-\textbf{\textcolor{MainBlue}{这说明什么}}
-
-\vspace{0.15em}
-\footnotesize
-\begin{itemize}
-  \setlength\itemsep{0.25em}
-  \item 问题不是 ``能不能把 KV 文件写到磁盘''；
-  \item 问题是 ``Prefill 复用和 Decode 执行前，哪些 KV 已经 ready''；
-  \item 冷层容量越大，越需要 pre-pass、restore 和 ready barrier；
-  \item 随机低局部性请求不能用同一套 SLA 承诺包装成成功。
-\end{itemize}
 
 \vspace{0.35em}
-\begin{beamercolorbox}[wd=\linewidth,sep=0.6em,rounded=true]{block body}
-\footnotesize
-\textbf{\textcolor{AccentRed}{结论：}}
-1M KV 管理不是透明 offload，而是服务系统必须显式管理的
-\textbf{prefill/decode readiness} 问题。
-\end{beamercolorbox}
-\end{column}
-\end{columns}
 
-\end{frame}
-
-\begin{frame}[t]{Motivation: cold miss 会同时破坏 Prefill 与 Decode}
-\small
-\vspace{-0.45em}
-
-\begin{beamercolorbox}[wd=\linewidth,sep=0.55em,rounded=true]{block body}
-\scriptsize
-\textbf{\textcolor{MainBlue}{控制变量：}}
-我们已经实现真实 cold-tier 文件迁移、异步 restore、sidecar admission 和 vLLM connector load。
-在 16/64/128/256 小矩阵中，重启 vLLM 后外部 KV load 可被真实触发，且
-\texttt{sync\_ssd\_miss\_total=0}。
-\end{beamercolorbox}
-
-\vspace{0.25em}
-
-\begin{columns}[T,onlytextwidth]
-\begin{column}{0.49\textwidth}
-\begin{block}{Prefill failure：复用失败，退化成重算}
-\footnotesize
-\begin{itemize}
-  \item 历史 KV 不在 HBM/DRAM ready set；
-  \item prefix/session reuse 无法直接使用；
-  \item 系统要么等待 cold-tier restore；
-  \item 要么重新 prefill 大段历史上下文，TTFT 被重计算成本拉爆。
-\end{itemize}
+\begin{block}{2、KV 多级存储正在成为支撑长上下文服务的必要机制}
+长上下文 KV 状态会随 token 数、模型层数和并发请求数快速增长，GPU 显存难以长期容纳所有可复用 KV。因此，将 KV 扩展到 CPU 内存和 SSD 等更大容量层级，是突破显存限制、降低重复 prefill 成本的重要方向。
 \end{block}
-\end{column}
 
-\begin{column}{0.49\textwidth}
-\begin{block}{Decode failure：执行期 miss，阻塞生成}
-\footnotesize
-\begin{itemize}
-  \item 请求已经进入 vLLM 调度；
-  \item worker 才发现 KV 在 SSD/3FS；
-  \item decode path 被迫等待同步 I/O；
-  \item ITL / TPOT / batch tail latency 一起放大。
-\end{itemize}
+\vspace{0.35em}
+
+\begin{block}{3、KV 跨请求复用决定了多轮长上下文服务能否真正高效。}
+对于多轮 RAG、代码助手和 Agent 任务，后续请求往往会反复引用前序历史上下文。如果历史 KV 不能跨请求持久保存和准确复用，系统就只能反复重算相同上下文，导致 TTFT、吞吐和服务成本显著恶化。
 \end{block}
-\end{column}
-\end{columns}
-
-\vspace{0.4em}
-
-\begin{beamercolorbox}[wd=\linewidth,sep=0.65em,rounded=true]{block body}
-\textbf{\textcolor{AccentRed}{核心判断：}}
-KV Anti-Caching 要解决的不是 ``如何让一次磁盘读更快''，
-而是\textbf{不让冷层 miss 破坏 prefill reuse，也不让未 ready 的 KV 进入 decode execution}。
-\end{beamercolorbox}
-
-\end{frame}
-
-\begin{frame}[t]{Why it matters? 为什么重要？为什么现在重要？}
-\small
-\vspace{-0.2em}
-
-\begin{itemize}
-  \setlength\itemsep{1.15em}
-
-  \item Agent、多轮工具调用和科学发现任务正在把 ``上下文'' 变成长期服务状态。
-  历史文档、tool trace、实验日志和中间推理都希望在后续请求中被精确复用。
-  \textbf{长程记忆不能只靠重新 prefill；否则 TTFT 与成本会随历史线性膨胀。}
-
-  \item 1M tokens 让 KV 容量问题从显存优化变成系统问题。
-  HBM/DRAM/3FS/SSD、网络、H2D、后台恢复和调度准入都进入同一条 SLA 链路。
-  \textbf{任何一个资源尾延迟失控，最终都表现为用户可见的首 token 延迟。}
-
-  \item 生产系统需要可承诺的服务边界。
-  对高复用 workload，应尽量把历史 KV 命中率做到 90\% 以上；
-  对 low-locality 1M 请求，系统应延迟、降级或拒绝，而不是把失败藏在平均值里。
-\end{itemize}
-
-\vspace{0.3em}
-\begin{beamercolorbox}[wd=\linewidth,sep=0.7em,rounded=true]{block body}
-\textbf{\textcolor{AccentRed}{核心判断：}}
-超长上下文推理不是把上下文长度参数调大，而是让 KV 状态在多级存储中
-\textbf{可复用、可准入、可恢复、可观测、可拒绝}。
-\end{beamercolorbox}
-
 \end{frame}
 
 \begin{frame}[t]{Why existing work fail? 为什么已有工作没有解决？}
-\small
-\vspace{-0.4em}
+\fontsize{6.5pt}{7.4pt}\selectfont
+\vspace{-0.75em}
 
-\begin{block}{1. GPU KV 管理与前缀复用}
-\textbf{代表工作：} vLLM / PagedAttention, vLLM APC, SGLang / RadixAttention
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.45}
+\begin{tabularx}{\linewidth}{
+  >{\raggedright\arraybackslash}p{0.15\linewidth}
+  >{\centering\arraybackslash}p{0.20\linewidth}
+  >{\raggedright\arraybackslash}p{0.28\linewidth}
+  >{\raggedright\arraybackslash}X}
+\rowcolor{gray!35}
+\textbf{类别} & \textbf{代表方法} & \textbf{具体措施} & \textbf{关键不足} \\
+\hline
+GPU 内 KV 管理 &
+PagedAttention, APC（vLLM）, RadixAttention（SGLang） &
+将 KV 切分为 block/page，并以 hash 或 radix tree 复用相同前缀，从而减少 GPU 内存碎片与重复 prefill &
+主要优化\textbf{已在 GPU/CPU 的热 KV}，但一旦KV超过容量闲置发生驱逐，就缺少面向SSD/外部冷层对象的持久化恢复协议，也没有恢复前的准入预算与。 \\
+\hline
+外部 KV cache 与解耦 serving &
+LMCache, Mooncake, DistServe, NIXL connector &
+engine 外 KV store、prefill/decode 分离、跨实例 KV 传输 &
+能搬 KV，但通常不保证\textbf{请求进入前 required KV 全部 ready}；SLA 准入和冷层预算仍外置。 \\
+\hline
+SSD-backed KV 与长上下文搬运 &
+KVDrive, Tutti, DualPath, InfiniGen &
+从 CPU/SSD 取 critical KV，用窗口、流水或 slack 隐藏 I/O &
+回答的是\textbf{要搬哪些 KV、如何搬得快}；没有解决多轮历史 KV 何时变冷、何时恢复、恢复不完能否准入。 \\
+\hline
+RAG / 文档片段 KV 复用 &
+RAGCache, CacheBlend &
+缓存共享文档或 chunk 的 KV，减少重复 prefill &
+证明复用有价值，但对象主要是文档片段；缺少会话级 persistent KV 状态、三级 residency 与 cold-tier 恢复协议。 \\
+\hline
+近似、压缩与驱逐 &
+H2O, Scissorhands, CacheGen, KVServe &
+剪枝 heavy hitter、压缩 KV 或降低传输量 &
+可缓解容量/带宽，但可能改变精确 attention 语义；仍不回答 cold miss 如何不进入 prefill/decode 关键路径。 \\
+\end{tabularx}
 
-\vspace{0.25em}
-\textbf{具体措施：} 分页 KV、连续批处理、block hash、prefix tree、跨请求前缀复用。
-
-\vspace{0.25em}
-\textbf{\textcolor{AccentRed}{关键不足：}}
-这类工作主要让\textbf{已经在执行层或可快速访问层的 KV} 更高效复用。
-它们没有把 3FS/SSD cold tier 纳入 admission window、ready barrier 和带宽预算，
-因此不能保证 1M 历史 KV 在 prefill reuse 前和 decode execution 前都必定 ready。
-\end{block}
-
-\vspace{0.45em}
-
-\begin{block}{2. 外部 KV cache / disaggregated serving}
-\textbf{代表工作：} LMCache, Mooncake, DistServe, vLLM NIXL connector
-
-\vspace{0.25em}
-\textbf{具体措施：} engine 外 KV cache、prefill/decode 分离、跨实例 KV transfer、SLO-aware 调度。
-
-\vspace{0.25em}
-\textbf{\textcolor{AccentRed}{关键不足：}}
-它们非常接近我们的方向，但通常不以\textbf{精确 1M + no synchronous cold miss + 3FS capacity tier}
-作为核心不变量。我们的差异必须落在 prefill/decode 两阶段准入语义、cold object、partial promote 与负对照边界。
-\end{block}
-
-\end{frame}
-
-\begin{frame}[t]{Why existing work fail? 为什么已有工作没有解决？}
-\small
-\vspace{-0.4em}
-
-\begin{block}{3. SSD-backed KV 与恢复加速}
-\textbf{代表工作：} Tutti, CacheFlow, DualPath, FlexGen
-
-\vspace{0.25em}
-\textbf{具体措施：} 本地 NVMe fast path、GPU I/O、slack-aware I/O、token/layer/GPU 三维恢复、
-storage-to-prefill / storage-to-decode 双路径。
-
-\vspace{0.25em}
-\textbf{\textcolor{AccentRed}{关键不足：}}
-这些工作更多回答 ``给定要恢复的 KV，如何更快搬运''。
-但我们的核心问题还包括：\textbf{哪些 KV 应该变冷、何时恢复、没恢复完能不能准入、
-如何保证冷层 miss 不导致 prefill 重算或 decode 同步等待}。
-\end{block}
-
-\vspace{0.45em}
-
-\begin{block}{4. 近似、压缩与驱逐}
-\textbf{代表工作：} H2O, Scissorhands, CacheGen 等
-
-\vspace{0.25em}
-\textbf{具体措施：} KV 剪枝、heavy-hitter 保留、压缩传输、近似长上下文。
-
-\vspace{0.25em}
-\textbf{\textcolor{AccentRed}{关键不足：}}
-它们可能降低容量压力，但会改变精确 attention 的问题定义。
-本项目第一版目标是不牺牲语义精确性，压缩只能作为后续可插拔扩展。
-\end{block}
+\vspace{0.35em}
+\begin{beamercolorbox}[wd=\linewidth,sep=0.5em,rounded=true]{block body}
+\textbf{\textcolor{AccentRed}{总结：}}
+现有工作多在优化 ``命中后如何更快''；我们的场景失败在 ``未命中前没有状态索引、恢复计划和准入边界''。
+\end{beamercolorbox}
 
 \end{frame}
 

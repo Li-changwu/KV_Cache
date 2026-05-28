@@ -1711,3 +1711,66 @@
   - `python -m py_compile benchmarks/m3/run_baseline_readiness_matrix.py benchmarks/m3/run_reuse_smoke_matrix.py benchmarks/m3/cold_tier.py`：通过。
   - `git diff --check`：通过。
   - 清理检查：8000/8010 端口均无服务，未发现 `vllm serve`、`EngineCore`、`http_sidecar_cli` 残留进程。
+
+### 阶段 M3.15-C：2K/8K/16K packed PrePass 趋势
+- **状态：** complete
+- 时间：2026-05-28T06:24:00Z
+- 执行的操作：
+  - 按用户要求不再跑 512，直接补齐 2K 与 16K packed PrePass gate，并与既有 8K 形成趋势分析。
+  - 2K 路径：启动 Qwen2.5-14B + M3 connector，`--max-model-len 16384 --max-num-batched-tokens 16384`；运行 store、packed demote、重启 vLLM、PrePass restore、online reuse；随后补 B0 与严格 B2 restart baseline。
+  - 16K 路径：启动 Qwen2.5-14B + M3 connector，`--max-model-len 32768 --max-num-batched-tokens 32768`；运行同样的 packed PrePass 路径；随后补 B0 与严格 B2 restart baseline。
+  - 首次 2K connector vLLM 启动失败，根因为子进程无法导入 `benchmarks.m3.noop_connector`：`ModuleNotFoundError: No module named 'benchmarks'`。修正为显式设置 `PYTHONPATH=/root/KV` 后重跑；失败日志保留为 `vllm_store_failed_no_pythonpath.log`，未纳入结果。
+  - 生成趋势产物：`results/m3_15_2k16k_trend/trend_summary.csv`、`trend_summary.json` 和 `docs/research/m3_15_2k16k_packed_prepass_trend.md`。
+- 关键结果：
+  - 2K：B0 `673.969ms`，B2 `689.483ms`，B5 online `301.511ms`，restore executor `823.925ms`，request-arrival restore-inclusive `1151.451ms`。
+  - 8K：B0 `2409.141ms`，B2 `2418.796ms`，B5 online `710.835ms`，restore executor `3046.794ms`，request-arrival restore-inclusive `3797.230ms`。
+  - 16K：B0 `5493.655ms`，B2 `5533.513ms`，B5 online `882.298ms`，restore executor `4581.719ms`，request-arrival restore-inclusive `5519.967ms`。
+  - B5 online/B0 随上下文增大持续改善：2K `0.447366x`，8K `0.295057x`，16K `0.160603x`。
+  - request-arrival restore-inclusive/B0 随上下文增大接近打平：2K `1.708463x`，8K `1.576176x`，16K `1.004790x`。
+  - 三个 B5 样本均通过 saved-token guard，reuse 阶段均为 `external_load_observed=yes`、`store_events=0`、`load_events=1`、`sync_ssd_miss_total=0`。
+- 结论：
+  - 趋势是稳定的：如果 PrePass restore 能提前隐藏，persistent KV Anti-Caching 的 online TTFT 收益随上下文增长而增强。
+  - 若请求到达后才 restore，2K/8K 仍慢于 B0，16K 才接近打平；因此当前系统还不能声称同步恢复满足 SLA，下一步仍要优化 restore/load 数据面和 lead-time 调度。
+  - B2 在 2K/8K/16K 都接近 B0，继续说明 vLLM APC 跨重启不持久化历史 KV，Persistent KV 的研究问题没有被原生 APC 覆盖。
+- 验证/清理：
+  - 2K 和 16K 实验结束后均确认无 `vllm serve`、`EngineCore`、`http_sidecar_cli`、`run_baseline_readiness`、`run_reuse_smoke_matrix` 残留。
+  - GPU 显存回落到 `11 MiB`。
+
+### 阶段 M3.16-A：LongMemEval workload adapter 接入
+- **状态：** in_progress
+- 时间：2026-05-28T07:18:00Z
+- 执行的操作：
+  - 查询 LongMemEval 官方 README 与 Hugging Face dataset metadata，确认 cleaned 数据入口、字段格式和 MIT license。
+  - 新增 `benchmarks/m3/longmemeval_workload.py`，把 `haystack_sessions` 格式化为历史 prefix，把 `question` 格式化为在线 suffix，输出 JSONL/CSV/summary/report manifest。
+  - 新增 tokenizer-aware token budget：默认使用 `/root/models/Qwen2.5-14B-Instruct`，测试可使用 deterministic whitespace tokenizer。
+  - 新增完整性检查 `ensure_complete_json_file()`，防止 Hugging Face 下载半截 JSON 后被误用。
+  - 给 `run_reuse_smoke_matrix.py` 增加 `--workload-manifest`，允许 LongMemEval manifest 覆盖 synthetic prompt，同时沿用现有 sidecar/connector/cold-tier 路径。
+  - 使用 fixture 数据生成 dry-run 产物：`results/m3_16_longmemeval_fixture/manifest/` 与 `results/m3_16_longmemeval_fixture/reuse_dryrun/`。
+  - 新增研究记录 `docs/research/m3_16_longmemeval_workload_integration.md`，明确当前是接入口验证，不是官方 LongMemEval-S 性能结果。
+- 当前阻塞：
+  - 官方 Hugging Face 文件下载不稳定。`curl` 多次超时并留下 partial JSON；`aria2c` 一次 TLS handshake failure；`datasets` streaming 未及时返回。
+  - `data/longmemeval/longmemeval_oracle.json` 曾是 9.4MB 半截文件，解析时报 `JSONDecodeError`，已删除并通过完整性检查覆盖该风险。
+- 验证：
+  - `pytest tests/m3/test_longmemeval_workload.py -q`：通过。
+  - `pytest tests/m3/test_reuse_smoke_matrix.py::test_online_payloads_can_use_longmemeval_workload_manifest tests/m3/test_reuse_smoke_matrix.py::test_load_workload_manifest_rows_selects_requested_prefix -q`：通过。
+  - `python -m py_compile benchmarks/m3/longmemeval_workload.py benchmarks/m3/run_reuse_smoke_matrix.py`：通过。
+
+### 阶段 M3.17-A：CCF-A 论文初稿写作
+- **状态：** complete
+- 时间：2026-05-28T12:25:00Z
+- 执行的操作：
+  - 使用 academic-research-suite 的 academic-paper 写作流程，结合 planning-with-files-zh 与 context-engineering 恢复项目语境。
+  - 盘点 `docs/research/`、`docs/specs/`、`results/m3_15_2k16k_trend/`、`results/m3_16_longmemeval_s_b0_b5_real/` 等本地证据。
+  - 通过 arXiv API/官方文档核验 Anti-Caching、PagedAttention/vLLM、LMCache、Mooncake、Tutti、KVDrive、CacheBlend、LongMemEval 等相关工作基本信息。
+  - 新增 `docs/paper/persistent_kv_anti_caching.md`，完成 Abstract、Introduction、Related Work、Design 和简短 Discussion/Open Problems。
+  - 新增 `docs/paper/evidence_table.md`，记录论文中使用的本地证据与不能越界的结论。
+  - 新增 `docs/paper/references.bib`，为后续 LaTeX 化准备 BibTeX。
+- 关键写作边界：
+  - 只声称 prototype 证明了 correctness/control-plane invariant 和小规模 vLLM feasibility。
+  - 不声称已实现 1M 生产服务。
+  - 不声称真实 3FS 集群性能已测。
+  - 不声称已经优于 KVDrive/LMCache/Tutti/Mooncake 等强 baseline。
+- 下一步：
+  - 把 Markdown 草稿整理为 LaTeX conference skeleton。
+  - 补 Evaluation methodology、完整实验计划、limitations 和 threat-to-validity。
+  - 后续实验补强 baseline 与 p95/p99 并发结果后，再把 preliminary results 升级为正式 Evaluation。

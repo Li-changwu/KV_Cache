@@ -244,9 +244,29 @@
 - [x] 重启 vLLM 后运行 8K `--prepass-before-reuse`，验证 `SSD_COLD -> packed restore -> ADMIT -> external load`
 - [x] 输出研究报告 `docs/research/m3_15_8k_packed_prepass_gate.md`
 - [x] 补同配置 8K B0/B2 baseline：同样使用 `--max-model-len 16384 --max-num-batched-tokens 16384`
-- [ ] 跑 512/2K/8K compact packed PrePass matrix，复核 restore scaling 和 token-mismatch guard
-- [ ] 优化 packed restore/load 数据面，降低 8K restore executor 与 connector load 时间
-- [ ] 在 8K baseline 与数据面归因完成后，再进入 16K gate
+- [x] 按用户要求跳过 512，完成 2K/16K packed PrePass gate，并与既有 8K 形成 2K/8K/16K 趋势表
+- [x] 输出趋势报告 `docs/research/m3_15_2k16k_packed_prepass_trend.md`
+- [ ] 优化 packed restore/load 数据面，降低 8K/16K restore executor 与 connector load 时间
+- [ ] 建立 2K/8K/16K lead-time matrix，量化提前多久 PrePass 才能把 restore 稳定隐藏
+- [ ] 数据面归因后再进入 32K gate
+- **状态：** in_progress
+
+### 阶段 M3.16：LongMemEval-S 公共多轮长记忆 Workload 接入
+- [ ] 确认 LongMemEval cleaned 官方入口、许可与 S/oracle 文件格式
+- [ ] 实现 LongMemEval workload adapter：把 `haystack_sessions` 转成历史 KV prefix，把 `question` 转成本轮 suffix
+- [ ] 支持 Qwen tokenizer 计数与 2K/8K/16K token-budget 裁剪，输出可复现 JSONL/CSV manifest
+- [ ] 将 manifest 接入现有 `run_reuse_smoke_matrix.py`，允许真实数据 prompt 复用当前 B5 PrePass/cold-tier 路径
+- [ ] 先生成小样本 dry-run，再选择 1 个 2K LongMemEval-S/Oracle 样本跑真实端到端验证
+- [ ] 在研究报告中区分 synthetic microbenchmark 与 public long-memory workload benchmark
+- **状态：** in_progress
+
+### 阶段 M3.17：CCF-A 系统论文初稿
+- [x] 盘点本地设计文档、实验结果和 LongMemEval-S 样本证据
+- [x] 核验 Anti-Caching、PagedAttention/vLLM、LMCache、Mooncake、Tutti、KVDrive、CacheBlend、LongMemEval 等相关工作基本信息
+- [x] 在 `docs/paper/` 创建论文证据表、BibTeX 和英文论文草稿
+- [x] 重点完成 Abstract、Introduction、Related Work、Design
+- [x] 在正文中显式区分 prototype evidence、design target 和 future production claim
+- [ ] 下一步把 Markdown 草稿转成 LaTeX conference skeleton，并补 Evaluation/Methodology/Limitations 成完整投稿形态
 - **状态：** in_progress
 
 ### 研究阶段 R2：KV Anti-Caching 方案深化
