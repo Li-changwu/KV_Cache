@@ -1,0 +1,70 @@
+# Python caches and test output
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Virtual environments and local environment files
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Secrets and local credentials
+*.pem
+*.key
+*.token
+id_rsa*
+id_ed25519*
+secrets.*
+
+# Experiment outputs and generated artifacts
+results/
+runs/
+artifacts/
+tmp/
+temp/
+*.log
+
+# Large model / tensor / benchmark payloads
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.gguf
+*.npy
+*.npz
+*.onnx
+
+# Generated documents and third-party papers
+*.pdf
+
+# LaTeX build products
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.lof
+*.lot
+*.out
+*.run.xml
+*.synctex.gz
+*.toc
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
