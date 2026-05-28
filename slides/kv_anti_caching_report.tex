@@ -68,155 +68,80 @@
 
 \vspace{0.35em}
 
-\begin{block}{3、KV 跨请求复用决定了多轮长上下文服务能否真正高效。}
+\begin{block}{3、KV 跨请求复用决定了多轮长上下文服务能否真正高效}
 对于多轮 RAG、代码助手和 Agent 任务，后续请求往往会反复引用前序历史上下文。如果历史 KV 不能跨请求持久保存和准确复用，系统就只能反复重算相同上下文，导致 TTFT、吞吐和服务成本显著恶化。
 \end{block}
 \end{frame}
 
 \begin{frame}[t]{Why existing work fail? 为什么已有工作没有解决？}
-\fontsize{6.5pt}{7.4pt}\selectfont
-\vspace{-0.75em}
+\fontsize{6.8pt}{7.6pt}\selectfont
+\vspace{-0.8em}
 
-\setlength{\tabcolsep}{3pt}
-\renewcommand{\arraystretch}{1.45}
+\setlength{\tabcolsep}{2.4pt}
+\renewcommand{\arraystretch}{1.25}
 \begin{tabularx}{\linewidth}{
-  >{\raggedright\arraybackslash}p{0.15\linewidth}
-  >{\centering\arraybackslash}p{0.20\linewidth}
-  >{\raggedright\arraybackslash}p{0.28\linewidth}
-  >{\raggedright\arraybackslash}X}
+>{\raggedright\arraybackslash}p{0.15\linewidth}
+>{\centering\arraybackslash}p{0.20\linewidth}
+>{\raggedright\arraybackslash}p{0.29\linewidth}
+>{\raggedright\arraybackslash}X}
 \rowcolor{gray!35}
 \textbf{类别} & \textbf{代表方法} & \textbf{具体措施} & \textbf{关键不足} \\
 \hline
+
 GPU 内 KV 管理 &
-PagedAttention, APC（vLLM）, RadixAttention（SGLang） &
-将 KV 切分为 block/page，并以 hash 或 radix tree 复用相同前缀，从而减少 GPU 内存碎片与重复 prefill &
-主要优化\textbf{已在 GPU/CPU 的热 KV}，但一旦KV超过容量闲置发生驱逐，就缺少面向SSD/外部冷层对象的持久化恢复协议，也没有恢复前的准入预算与。 \\
+PagedAttention, APC, RadixAttention &
+将 KV 切块管理，并用哈希表或前缀树复用相同前缀，减少显存碎片和重复预填充。 &
+主要解决 \textbf{HBM/CPU 内热 KV 的管理与复用}；一旦历史 KV 超出容量并进入 SSD/外部冷层，就缺少持久化对象抽象、精确定位协议和恢复前 SLA 预算。 \\
 \hline
-外部 KV cache 与解耦 serving &
-LMCache, Mooncake, DistServe, NIXL connector &
-engine 外 KV store、prefill/decode 分离、跨实例 KV 传输 &
-能搬 KV，但通常不保证\textbf{请求进入前 required KV 全部 ready}；SLA 准入和冷层预算仍外置。 \\
+
+PD 分离与跨实例 KV 传输 &
+DistServe, Splitwise, NIXL connector, Mooncake &
+分离预填充和解码实例，并在阶段之间传递 KV，降低资源干扰。 &
+解决阶段隔离，但没有把长期历史 KV 当作可恢复的服务状态来管理。 \\
 \hline
-SSD-backed KV 与长上下文搬运 &
-KVDrive, Tutti, DualPath, InfiniGen &
-从 CPU/SSD 取 critical KV，用窗口、流水或 slack 隐藏 I/O &
-回答的是\textbf{要搬哪些 KV、如何搬得快}；没有解决多轮历史 KV 何时变冷、何时恢复、恢复不完能否准入。 \\
+
+外部 KV 缓存层 &
+LMCache, Mooncake &
+在推理引擎外维护 KV 缓存，支持跨请求、跨实例复用，并扩展到主存或 SSD。 &
+偏缓存扩容；缺少超长历史 KV 的精确索引、恢复屏障和执行前就绪保证。 \\
 \hline
-RAG / 文档片段 KV 复用 &
-RAGCache, CacheBlend &
-缓存共享文档或 chunk 的 KV，减少重复 prefill &
-证明复用有价值，但对象主要是文档片段；缺少会话级 persistent KV 状态、三级 residency 与 cold-tier 恢复协议。 \\
+
+冷层存储与恢复调度 &
+Tutti, CacheFlow, DualPath, FlexGen, Infinite-LLM &
+从主存、SSD 或远端存储恢复 KV，并用流水、并行和调度隐藏 I/O。 &
+主要回答 \textbf{如何把 KV 搬得更快}；没有系统回答多轮历史 KV 何时变冷、何时恢复、恢复不完能否准入，冷 I/O 仍可能暴露在 TTFT 临界路径。 \\
 \hline
+
+文档片段复用 &
+CacheBlend, RAGCache &
+面向 RAG 或多文档场景复用共享文档、chunk 或非严格前缀 KV，通过融合或选择性重算降低 TTFT。 &
+主要复用文档片段，不等价于完整会话历史；难以直接支撑精确长上下文复用。 \\
+\hline
+
 近似、压缩与驱逐 &
-H2O, Scissorhands, CacheGen, KVServe &
-剪枝 heavy hitter、压缩 KV 或降低传输量 &
-可缓解容量/带宽，但可能改变精确 attention 语义；仍不回答 cold miss 如何不进入 prefill/decode 关键路径。 \\
+H2O, Scissorhands, CacheGen, TTKV, KVDrive &
+通过压缩、量化或重要性筛选降低 KV 容量和带宽开销。&
+可以缓解容量/带宽瓶颈，但可能改变精确 attention 语义；不适合作为 1M 级精确长上下文服务的基础机制。 \\
+
 \end{tabularx}
 
 \vspace{0.35em}
 \begin{beamercolorbox}[wd=\linewidth,sep=0.5em,rounded=true]{block body}
 \textbf{\textcolor{AccentRed}{总结：}}
-现有工作多在优化 ``命中后如何更快''；我们的场景失败在 ``未命中前没有状态索引、恢复计划和准入边界''。
+已有工作分别优化了 `KV 如何复用''、`KV 如何传输'' 和 ``KV 如何搬得更快''；
+但它们普遍没有把长期历史 KV 抽象为 \textbf{可持久化、可索引、可恢复、可准入的 serving state}，
+因此无法在 1M 级多轮长上下文服务中稳定避免重复 prefill 与 decode-path cold I/O。
 \end{beamercolorbox}
 
 \end{frame}
 
-\begin{frame}[t]{Why our current work is not enough? 当前原型还没有解决什么？}
-\small
-\vspace{-0.5em}
-
-\begin{columns}[T,onlytextwidth]
-\begin{column}{0.49\textwidth}
-\begin{block}{我们已经证明的事情}
-\footnotesize
-\begin{itemize}
-  \setlength\itemsep{0.18em}
-  \item sidecar + vLLM connector 可以形成真实 KV save/load 闭环；
-  \item cold-tier demote/restore 已从元数据迁移推进到真实文件迁移；
-  \item 16/64/128/256 restart 小矩阵中，probe 为 DELAY，restore 后 ADMIT；
-  \item qd4 adapter benchmark 已输出 batch restore 与有效吞吐。
-\end{itemize}
-\end{block}
-\end{column}
-
-\begin{column}{0.49\textwidth}
-\begin{block}{仍没有解决好的事情}
-\footnotesize
-\begin{itemize}
-  \setlength\itemsep{0.18em}
-  \item 前缀规模仍是小矩阵，不是 32K/128K/1M；
-  \item \texttt{3fs\_posix} 仍是本地目录模拟，不是真实 3FS 集群；
-  \item cold object 仍近似按 prefix/layer 文件组织，没有 packed object 和 partial promote；
-  \item 调度器还不是多资源预算控制，缺少真实 p99 tail 和短请求保护。
-\end{itemize}
-\end{block}
-\end{column}
-\end{columns}
-
-\vspace{0.45em}
-\begin{beamercolorbox}[wd=\linewidth,sep=0.65em,rounded=true]{block body}
-\textbf{\textcolor{AccentRed}{因此：}}
-当前工作已经证明 ``路径可以走通''，但还没有证明 ``1M exact long-context serving 可以稳定满足 SLA''。
-接下来必须从功能闭环进入容量、尾延迟、带宽预算和强 baseline 验证。
-\end{beamercolorbox}
-
-\end{frame}
-
-\begin{frame}[t]{What is our goal? 我们要解决什么？}
-\small
-\vspace{-0.25em}
-
-\begin{beamercolorbox}[wd=\linewidth,sep=0.85em,rounded=true]{block body}
-\textbf{\textcolor{AccentRed}{目标：}}
-在\alert{不改变 attention 语义、不依赖有损压缩、不把 SSD/3FS 当透明显存}的前提下，
-让百万级历史 KV 成为推理服务可准入、可恢复、可验证、可调度的 memory-primary anti-cache 状态。
-\end{beamercolorbox}
-
-\vspace{0.65em}
-
-\begin{columns}[T,onlytextwidth]
-\begin{column}{0.49\textwidth}
-\begin{block}{我们不做什么}
-\footnotesize
-\begin{itemize}
-  \setlength\itemsep{0.25em}
-  \item 不修改 attention kernel 或改变模型输出语义；
-  \item 不承诺随机 low-locality 1M 请求低 TTFT；
-  \item 不允许用冷层同步读掩盖 prefill reuse 失败或 decode miss。
-\end{itemize}
-\end{block}
-\end{column}
-
-\begin{column}{0.49\textwidth}
-\begin{block}{我们要做什么}
-\footnotesize
-\begin{itemize}
-  \setlength\itemsep{0.25em}
-  \item admission 前枚举本轮 required KV；
-  \item 冷层 KV 只能后台 restore 或明确 fallback；
-  \item prefill reuse 与 decode execution 都必须经过 ready barrier。
-\end{itemize}
-\end{block}
-\end{column}
-\end{columns}
-
-\vspace{0.65em}
-
-\begin{beamercolorbox}[wd=\linewidth,sep=0.75em,rounded=true]{block body}
-\textbf{\textcolor{MainBlue}{核心思想：}}
-把 cold KV miss 从 prefill/decode 执行期异常，变成 admission 前可见、可批量调度、可延迟、可 fallback 或可拒绝的系统事件。
-\end{beamercolorbox}
-
-\end{frame}
-
-\begin{frame}[t]{What is your key idea? 挑战从哪里来？}
+\begin{frame}[t]{What is your key idea?}
 \small
 \vspace{-0.45em}
 
 \begin{beamercolorbox}[wd=\linewidth,sep=0.55em,rounded=true]{block body}
-\textbf{\textcolor{MainBlue}{从目标推导挑战：}}
-如果要让 1M 历史 KV 在 prefill reuse 和 decode execution 前都必定 ready，系统必须完成闭环：
-\textbf{先知道要访问什么，再知道在哪里，最后判断能不能按 SLA 恢复。}
+\textbf{\textcolor{MainBlue}{核心思想：}}
+将多轮长上下文服务中的历史 KV 从“临时缓存”提升为“可持久化、可索引、可恢复到可执行状态、可准入控制的服务状态”，并通过 KV Evicted Index 与 KV PrePass 在请求进入 LLM 引擎前完成冷 KV 发现、校验与恢复，从而避免 SSD 冷数据访问阻塞 prefill 或 decode 关键路径。
 \end{beamercolorbox}
 
 \vspace{0.35em}
