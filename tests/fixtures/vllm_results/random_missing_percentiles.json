@@ -1,0 +1,15 @@
+{
+  "date": "20260524-120300",
+  "backend": "openai",
+  "label": "m1_5_latency_missing",
+  "model_id": "/root/models/gpt-oss-20b",
+  "num_prompts": 8,
+  "request_rate": 1.0,
+  "max_concurrency": 1,
+  "dataset_name": "random",
+  "random_input_len": 512,
+  "random_output_len": 16,
+  "request_throughput": 1.0,
+  "output_throughput": 16.0,
+  "errors": []
+}

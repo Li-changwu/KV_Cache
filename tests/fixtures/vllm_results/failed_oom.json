@@ -1,0 +1,15 @@
+{
+  "date": "20260524-120200",
+  "backend": "openai",
+  "label": "m1_5_latency_32768_128",
+  "model_id": "/root/models/gpt-oss-20b",
+  "num_prompts": 32,
+  "request_rate": 1.0,
+  "max_concurrency": 1,
+  "dataset_name": "random",
+  "random_input_len": 32768,
+  "random_output_len": 128,
+  "request_throughput": 0.0,
+  "output_throughput": 0.0,
+  "errors": ["CUDA out of memory while allocating KV cache"]
+}

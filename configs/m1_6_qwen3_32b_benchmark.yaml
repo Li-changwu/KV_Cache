@@ -1,0 +1,35 @@
+model: /root/models/Qwen3-32B
+base_url: http://127.0.0.1:8000
+endpoint: /v1/completions
+result_dir: results/qwen3_32b_calibration
+raw_result_dir: results/qwen3_32b_calibration/raw
+
+random_smoke:
+  input_lens: [512, 2048]
+  output_lens: [16]
+  request_rates: [1]
+  max_concurrencies: [1]
+  num_prompts: 4
+
+latency_sweep:
+  input_lens: [512, 2048, 8192, 16384, 32768, 40960]
+  output_lens: [1, 16]
+  request_rates: [1]
+  max_concurrencies: [1]
+  num_prompts: 8
+
+serving_sweep:
+  input_lens: [2048, 8192]
+  output_lens: [64]
+  request_rates: [1]
+  max_concurrencies: [1, 2]
+  num_prompts: 8
+
+apc_sweep:
+  num_prefixes: [1, 4]
+  prefix_lens: [1024, 4096, 8192]
+  suffix_lens: [128]
+  output_lens: [64]
+  request_rates: [1]
+  max_concurrencies: [1]
+  num_prompts: 8

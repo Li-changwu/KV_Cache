@@ -1,0 +1,21 @@
+model: /root/models/Qwen2.5-14B-Instruct
+base_url: http://127.0.0.1:8000
+endpoint: /v1/completions
+result_dir: results/qwen25_14b_calibration
+raw_result_dir: results/qwen25_14b_calibration/raw
+
+random_smoke:
+  input_lens: [128]
+  output_lens: [1]
+  request_rates: [1]
+  max_concurrencies: [1]
+  num_prompts: 1
+
+apc_sweep:
+  num_prefixes: [1]
+  prefix_lens: [128]
+  suffix_lens: [16]
+  output_lens: [1]
+  request_rates: [1]
+  max_concurrencies: [1]
+  num_prompts: 1
