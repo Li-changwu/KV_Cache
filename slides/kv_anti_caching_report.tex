@@ -154,6 +154,7 @@ H2O, Scissorhands, CacheGen, TTKV, KVDrive &
 
 \begin{block}{Challenge 2：如何在请求进入 LLM 引擎之前判断其所需 KV 的冷热状态？}
 一个多轮请求可能依赖大量历史 KV 范围，其中一部分已经在 GPU/CPU 中 ready，一部分可能只在 SSD/3FS 中 cold，还有一部分可能正在恢复、缺失或与当前请求不匹配。系统必须在执行前枚举这些所需历史 KV，并将它们分类为 GPU-ready、CPU-ready、SSD-cold、fetching、loading、missing 或 mismatch，从而生成明确的 reuse plan 和 restore plan。
+\end{block}
 
 \vspace{0.35em}
 
