@@ -1459,3 +1459,82 @@
   - `pytest tests/m3/test_prepass_lead_time_planner.py -q`：先红灯缺失模块，补实现后 `4 passed in 0.10s`。
   - `python benchmarks/m3/plan_prepass_lead_time_matrix.py --prepass-csv results/m3_12_2k_prepass_true/b5_prepass_true/reuse_phase/reuse_smoke_matrix.csv --baseline-csv results/m3_11_2k_load_only_rerun/final/baseline_matrix.csv --result-dir results/m3_13_prepass_lead_time_plan --prefix-tokens 512 2048 8192 16384 32768 --suffix-tokens 128 --output-tokens 1 --available-leads-ms 0 1000 5000 12000`：`status=OK`，`rows=20`。
   - 发现本机缺少 `column` 命令，已改用 `sed` 查看 CSV。
+
+### 阶段 M3.14-A：Anti-Cache 启发整理与两个核心模块设计
+- **状态：** complete
+- 时间：2026-05-28T02:25:25Z
+- 执行的操作：
+  - 按用户要求使用 `context-engineering` 和 `planning-with-files-zh` 恢复项目上下文，读取 `AGENTS.md`、`task_plan.md`、`findings.md`、`progress.md`。
+  - 重新聚焦 Anti-Cache 论文给 KV 系统的机制启发：不是 100% 提前预测请求，而是通过内存常驻索引发现 cold data，通过 pre-pass 收集恢复位置，异步恢复后重新准入。
+  - 读取当前相关实现：`benchmarks/m3/control_plane.py`、`benchmarks/m3/tensor_store.py`、`benchmarks/m3/http_sidecar.py`，确认现有系统已有 KV manifest、tier/ready、cold object、PrePass 和 restore queue，但还缺内存常驻的统一 KV Evicted Index，以及真正的 packed cold object 布局。
+  - 设计下一步最应该落地的两个模块：`KV Evicted Index` 和 `Packed Cold Object`。
+  - 写入设计规格 `docs/specs/m3_14_kv_evicted_index_and_packed_object.md`。
+  - 更新 `task_plan.md`：新增 M3.14 阶段，并把 `KV Evicted Index` 提升为 P0。
+  - 更新 `findings.md`：记录 Anti-Cache 到 KV 的映射、三层存储语义和模块边界。
+- 输出文件：
+  - `docs/specs/m3_14_kv_evicted_index_and_packed_object.md`
+  - `task_plan.md`
+  - `findings.md`
+  - `progress.md`
+- 关键设计：
+  - `KV Evicted Index`：常驻 CPU 内存，记录 prefix/range/correctness key/tier/ready/object id/cold uri/extents/checksum/热度，支持 READY/COLD/FETCHING/MISSING/MISMATCH 分类。
+  - `Packed Cold Object`：SSD/3FS 上的连续大对象，对应 Anti-Cache Block Table，记录 object/extent offset/length/checksum，支撑顺序读和后续部分恢复。
+  - 请求进入 GPU 前必须经过控制面 PrePass：如果 required KV 在 SSD，则请求 `DELAY`，后台 SSD->CPU restore，校验后重新准入；SSD KV 永远不能被视为 ready。
+  - SSD->CPU 恢复队列与 CPU->HBM 加载队列应分离；前者是冷区恢复，后者是执行前加载。
+- 下一步建议：
+  - M3.14-B：先按 TDD 实现 `benchmarks/m3/kv_evicted_index.py` 和 `tests/m3/test_kv_evicted_index.py`。
+  - M3.14-C：把 `/prepass` 输出升级为 ready/cold/fetching/missing/mismatch sets。
+  - M3.14-D：实现 packed cold object v1 并跑 2K/8K packed vs per-layer restore 对比。
+
+### 阶段 M3.14-A：KV Evicted Index 独立模块实现
+- **状态：** complete
+- 时间：2026-05-28T03:18:00Z
+- 执行的操作：
+  - 按 TDD 新增 `tests/m3/test_kv_evicted_index.py`，先观察到红灯：`ModuleNotFoundError: No module named 'benchmarks.m3.kv_evicted_index'`。
+  - 新增 `benchmarks/m3/kv_evicted_index.py`，实现 CPU 常驻元数据索引，不保存 KV 张量本体。
+  - 支持从现有 `KVBlockManifest` 导入 prefix/range/correctness_key/tier/ready/cold_uri/object_id/offset_table/checksum/size_bytes。
+  - 支持 `lookup_required()`、`classify_required()`、`mark_fetching()`、`mark_ready()`、`mark_evicted()` 和 `touch()`。
+  - 将 `AGENTS.md` 补充 M3.14 当前阶段规则：先做 `KV Evicted Index` 与 `Packed Cold Object`，真实 3FS executor 暂列 P1。
+  - 更新 `task_plan.md`、`findings.md` 和 `progress.md`。
+- 输出文件：
+  - `benchmarks/m3/kv_evicted_index.py`
+  - `tests/m3/test_kv_evicted_index.py`
+  - `AGENTS.md`
+  - `task_plan.md`
+  - `findings.md`
+  - `progress.md`
+- 关键结果：
+  - READY：只有 `HBM/DRAM/CPU` 且 `ready=true` 才可直接进入可复用集合。
+  - COLD：`SSD/NVME/LOCAL_NVME/THREE_FS/3FS` 或存在 `cold_uri/object_id/extents` 时归为冷区，并返回 object/offset/length 信息。
+  - FETCHING：恢复任务入队后标记为 `FETCHING`，后续 PrePass 可据此避免重复恢复同一 range。
+  - MISMATCH：correctness key 不匹配时与 missing 分开，后续应禁止复用而不是尝试恢复。
+  - MISSING：prefix 未知或 range 未被现有 entry 覆盖时返回 missing。
+- 验证：
+  - `pytest tests/m3/test_kv_evicted_index.py -q`：先红灯缺失模块，补实现后 `7 passed in 1.27s`。
+  - `pytest tests/m3/test_kv_evicted_index.py tests/m3/test_prepass_planner.py tests/m3/test_prepass_planner_unit.py tests/m3/test_prefetch_queue.py -q`：`18 passed in 2.34s`。
+
+### 阶段 M3.14-B：PrePass 分类集合接入
+- **状态：** complete
+- 时间：2026-05-28T03:37:00Z
+- 执行的操作：
+  - 按 TDD 扩展 `tests/m3/test_prepass_planner.py`，要求 `/prepass` 响应新增 `classification` 与 `classification_counts` 字段。
+  - 红灯确认旧接口缺少分类集合：三个测试均因 `KeyError: 'classification'` 失败。
+  - 在 `SidecarRuntime` 中增加 runtime 级 `KVEvictedIndex`，保存 `requests` 以便 commit 时同步 correctness key。
+  - 在 `/commit`、proxy auto commit、tensor store manifest 读取、同步 restore 完成和异步 `/prefetch/advance` 完成时，同步索引元数据。
+  - 在 `/prepass` 中调用 `_classify_prepass_request()`，输出 `ready/cold/fetching/missing/mismatch` 五类集合，同时保留原有 `status`、`ready_before_request`、`restore_results` 字段。
+  - 对异步 restore 中的旧 cold manifest 做防覆盖处理：未 ready 的控制面或 tensor-store 状态不会覆盖索引中的 `FETCHING` 状态，只有 ready 后才能更新为 ready。
+- 输出文件：
+  - `benchmarks/m3/http_sidecar.py`
+  - `benchmarks/m3/kv_evicted_index.py`
+  - `tests/m3/test_prepass_planner.py`
+  - `task_plan.md`
+  - `findings.md`
+  - `progress.md`
+- 关键结果：
+  - 同步 PrePass 冷前缀响应中可看到 `classification.cold[0].prefix_id=session-a`，即使 restore 完成后整体 `status=READY`。
+  - 异步 PrePass 第一次请求为 `COLD -> QUEUED`；第二次请求在 restore 未完成前归入 `classification.fetching`，避免重复恢复同一 range。
+  - correctness mismatch 与 missing range 被分开输出：前者进入 `classification.mismatch` 并保持 `REJECT`，后者进入 `classification.missing` 并可走 full/delta prefill fallback 语义。
+- 验证：
+  - `pytest tests/m3/test_prepass_planner.py -q`：先红灯缺少分类字段，补实现后 `3 passed in 1.55s`。
+  - `python -m py_compile benchmarks/m3/kv_evicted_index.py benchmarks/m3/http_sidecar.py`：通过。
+  - `pytest tests/m3/test_kv_evicted_index.py tests/m3/test_prepass_planner.py tests/m3/test_prepass_planner_unit.py tests/m3/test_http_sidecar.py tests/m3/test_prefetch_queue.py -q`：`35 passed in 3.60s`。

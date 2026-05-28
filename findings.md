@@ -428,6 +428,20 @@
 - 新研究文档为 `docs/research/m3_13_next_research_plan.md`。它明确下一步顺序应是 512/2K/8K true PrePass 小矩阵 -> packed cold object / extent layout -> 16K/32K gate matrix。
 - 本机缺少 `column` 命令，查看 CSV 时改用 `sed`；后续脚本和验证不能依赖 `column`。
 
+## 2026-05-28 M3.14 Anti-Cache 启发整理与模块设计发现
+- 本轮结合 context-engineering 与 planning-with-files-zh，把数据库 Anti-Cache 的核心机制整理进项目规划。关键启发是：Anti-Cache 不需要在请求到达前 100% 预知是否访问冷数据，而是让所有索引留在内存中，请求执行时通过 evicted 标记发现冷数据，再进入 pre-pass 收集 block id / offset，异步读取并重新执行。
+- 映射到 KV 系统后，我们不能让 GPU 做真正试跑；缺失历史 KV 时注意力语义不完整。因此应做“控制面试跑”：请求进入 vLLM 前由 sidecar/control plane 查内存 KV 状态索引，判断 required KV 是否处于 HBM/CPU ready、SSD cold、FETCHING、MISSING 或 correctness mismatch。
+- 设计上明确 GPU/CPU/SSD 三层职责：HBM 是在线执行层，CPU 是可准入准备层，SSD 是冷区和持久化层。SSD 上的 KV 不是 ready，必须恢复到 CPU/HBM 并校验后才能被 connector 加载。
+- 下一步最应该落地的两个模块是：`KV Evicted Index` 与 `Packed Cold Object`。前者对应 Anti-Cache 的 Evicted Table，常驻 CPU 内存，只保存 prefix/range/tier/ready/object_id/offset/checksum 等元数据；后者对应 Block Table，把冷 KV 组织成一个或少量连续对象，避免长上下文下每层 safetensors 小文件造成 restore tail。
+- 已新增设计规格 `docs/specs/m3_14_kv_evicted_index_and_packed_object.md`。规格定义了 M3.14-A/B/C/D：独立 KV Evicted Index、PrePass 分类集合、packed object v1、2K/8K packed vs per-layer restore 对比。
+- 设计边界：第一版不引入压缩、不改变 exact attention 语义、不把 SSD->CPU 恢复队列和 CPU->HBM 加载队列混在一起、不因 prefix_id 相同绕过 correctness key。
+- M3.14-A 已完成独立实现：`benchmarks/m3/kv_evicted_index.py` 提供 `KVEvictedIndex`、`KVIndexEntry`、`KVExtentRef`、`KVLookupResult` 和 `KVClassification`，可以从现有 `KVBlockManifest` 导入状态，并按 `READY/COLD/FETCHING/MISSING/MISMATCH` 分类 required ranges。
+- `KVEvictedIndex` 的第一版保持纯内存、纯元数据，不保存 KV 张量本体；`SSD/NVME/LOCAL_NVME/THREE_FS/3FS` 等 tier 被归为 cold，`HBM/DRAM/CPU` 且 `ready=true` 才归为 ready，`FETCHING` 或存在 `fetching_request_id` 时会避免重复入队。
+- 新增测试 `tests/m3/test_kv_evicted_index.py` 覆盖：ready 命中、cold extent 定位、fetching 去重、correctness mismatch、missing range、mark_ready 状态切换和批量分类集合。
+- M3.14-B 已把 `/prepass` 响应升级为分类集合：新增 `classification` 与 `classification_counts` 字段，包含 `ready/cold/fetching/missing/mismatch` 五类。旧字段如 `status`、`ready_before_request`、`restore_results` 保持不变，避免破坏已有实验脚本。
+- sidecar 现在维护一个 runtime 级 `KVEvictedIndex`，从控制面 commit、tensor store manifest、同步/异步 restore 完成事件同步元数据。该索引仍是增强层，不强行替代现有 `KVManifest`，这是为了降低 M3.14-B 对在线路径的侵入。
+- 异步 PrePass 的第二次请求现在能看到 `FETCHING` 分类，而不是再次把同一个 cold prefix 当作普通 cold 任务入队。这对应数据库 Anti-Cache 中 evicted tuple 进入 pre-pass 后避免重复 fetch 同一 block 的思想。
+
 ## 视觉/浏览器发现
 - 本轮尚未使用视觉或浏览器资料。
 

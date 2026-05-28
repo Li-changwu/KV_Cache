@@ -23,6 +23,11 @@ from benchmarks.m3.control_plane import (
     SidecarResponse,
     TieredKVControlPlane,
 )
+from benchmarks.m3.kv_evicted_index import (
+    KVEvictedIndex,
+    KVClassification,
+    KVRangeStatus,
+)
 from benchmarks.m3.prefetch_queue import (
     AsyncPrefetchQueue,
     PrefetchQueue,
@@ -92,6 +97,7 @@ class SidecarRuntime:
         )
         self.log = DecisionLog(config.decision_log_path)
         self.responses: dict[str, SidecarResponse] = {}
+        self.requests: dict[str, SidecarRequest] = {}
         self.decisions: Counter[tuple[str, str]] = Counter()
         self.prefill_tokens_saved_total = 0
         self.sync_ssd_miss_total = 0
@@ -105,6 +111,7 @@ class SidecarRuntime:
             if config.tensor_store_path
             else None
         )
+        self.kv_index = KVEvictedIndex()
         self.prefetch_queue = (
             (AsyncPrefetchQueue if config.async_prefetch else PrefetchQueue)(
                 tensor_store=config.tensor_store_path,
@@ -132,6 +139,7 @@ class SidecarRuntime:
             response = self.control_plane.admit(request)
         barrier = self.control_plane.ready_barrier(response)
         self.responses[response.request_id] = response
+        self.requests[response.request_id] = request
         self._record(request, response, barrier, source)
         if residency_hits:
             self._record_residency_hit_event(
@@ -163,6 +171,17 @@ class SidecarRuntime:
             tier=tier,
             ready=ready,
         )
+        original_request = self.requests.get(request_id)
+        if original_request is not None:
+            self.kv_index.upsert(
+                prefix_id=prefix_id,
+                token_start=0,
+                token_end=token_end,
+                correctness_key=asdict(original_request.correctness_key),
+                tier=tier.value,
+                ready=ready,
+            )
+        self._sync_index_from_tensor_store(prefix_id)
         return {"status": "committed", "request_id": request_id}
 
     def auto_commit_from_connector_manifest(
@@ -187,6 +206,17 @@ class SidecarRuntime:
             token_end=token_end,
             tier=ConnectorState.DRAM,
         )
+        original_request = self.requests.get(request_id)
+        if original_request is not None:
+            self.kv_index.upsert(
+                prefix_id=prefix_id,
+                token_start=0,
+                token_end=token_end,
+                correctness_key=asdict(original_request.correctness_key),
+                tier=ConnectorState.DRAM.value,
+                ready=True,
+            )
+        self._sync_index_from_tensor_store(prefix_id)
         self._record_commit_event(
             sidecar_request=sidecar_request,
             sidecar_response=sidecar_response,
@@ -215,6 +245,7 @@ class SidecarRuntime:
         residency_hits = self._apply_residency_hits(request, response)
         if residency_hits:
             response = self.control_plane.admit(request)
+        classification = self._classify_prepass_request(request)
         restore_results: list[dict[str, Any]] = []
         errors: list[dict[str, str]] = []
         if response.decision == Decision.DELAY:
@@ -255,9 +286,19 @@ class SidecarRuntime:
                     self.prefetch_deadline_miss_total += 1
                 if result.status == "COMPLETED":
                     self.control_plane.mark_prefetched([required])
+                    self._sync_index_from_tensor_store(required.prefix_id)
+                elif result.status in {"QUEUED", "ALREADY_QUEUED"}:
+                    self.kv_index.mark_fetching(
+                        prefix_id=required.prefix_id,
+                        token_start=required.token_start,
+                        token_end=required.token_end,
+                        correctness_key=asdict(request.correctness_key),
+                        request_id=request.request_id,
+                    )
         final_response = self.control_plane.admit(request)
         barrier = self.control_plane.ready_barrier(final_response)
         self.responses[final_response.request_id] = final_response
+        self.requests[final_response.request_id] = request
         plan = build_prepass_plan(
             required_count=len(response.required_ranges),
             ready_count=sum(1 for required in response.required_ranges if self.control_plane.connector.is_ready(required)),
@@ -277,6 +318,8 @@ class SidecarRuntime:
             "required_ranges": [
                 _range_to_json(item) for item in response.required_ranges
             ],
+            "classification": classification.to_json(),
+            "classification_counts": _classification_counts(classification),
             "restore_results": restore_results,
             "errors": errors,
             "ready_barrier": _barrier_to_json(barrier),
@@ -305,6 +348,8 @@ class SidecarRuntime:
             for result in completed
         ]
         self.control_plane.mark_prefetched(required)
+        for result in completed:
+            self._sync_index_from_tensor_store(result.prefix_id)
         self._record_async_prefetch_advance(completed_json)
         return {"completed": completed_json, "async_prefetch": True}
 
@@ -353,6 +398,95 @@ class SidecarRuntime:
         self.prefill_tokens_saved_total += response.reuse_tokens
         self.sync_ssd_miss_total += barrier.sync_ssd_miss_total
         self.log.append(request, response, barrier, source)
+
+    def _classify_prepass_request(
+        self,
+        request: SidecarRequest,
+    ) -> KVClassification:
+        required = []
+        for candidate in request.prefix_candidates:
+            if not candidate.committed:
+                continue
+            self._sync_index_from_control_plane(
+                prefix_id=candidate.prefix_id,
+                token_start=candidate.token_start,
+                token_end=candidate.token_end,
+            )
+            self._sync_index_from_tensor_store(candidate.prefix_id)
+            required.append(
+                (
+                    candidate.prefix_id,
+                    candidate.token_start,
+                    candidate.token_end,
+                    asdict(request.correctness_key),
+                )
+            )
+        return self.kv_index.classify_required(required)
+
+    def _sync_index_from_control_plane(
+        self,
+        *,
+        prefix_id: str,
+        token_start: int,
+        token_end: int,
+    ) -> None:
+        entry = self.control_plane.manifest.lookup(
+            PrefixCandidate(
+                prefix_id=prefix_id,
+                token_start=token_start,
+                token_end=token_end,
+                committed=True,
+            )
+        )
+        if entry is None:
+            return
+        if not entry.ready and self._index_is_fetching(
+            prefix_id=entry.prefix_id,
+            token_start=entry.token_start,
+            token_end=entry.token_end,
+            correctness_key=asdict(entry.correctness_key),
+        ):
+            return
+        self.kv_index.upsert(
+            prefix_id=entry.prefix_id,
+            token_start=entry.token_start,
+            token_end=entry.token_end,
+            correctness_key=asdict(entry.correctness_key),
+            tier=entry.tier.value,
+            ready=entry.ready,
+        )
+
+    def _sync_index_from_tensor_store(self, prefix_id: str) -> None:
+        if self.tensor_store is None:
+            return
+        try:
+            manifest = self.tensor_store.read_manifest(prefix_id)
+        except FileNotFoundError:
+            return
+        if not manifest.ready and self._index_is_fetching(
+            prefix_id=manifest.prefix_id,
+            token_start=manifest.token_start,
+            token_end=manifest.token_end,
+            correctness_key=manifest.correctness_key,
+        ):
+            return
+        self.kv_index.upsert_from_manifest(manifest)
+
+    def _index_is_fetching(
+        self,
+        *,
+        prefix_id: str,
+        token_start: int,
+        token_end: int,
+        correctness_key: dict[str, Any],
+    ) -> bool:
+        result = self.kv_index.lookup_required(
+            prefix_id=prefix_id,
+            token_start=token_start,
+            token_end=token_end,
+            correctness_key=correctness_key,
+        )
+        return result.status == KVRangeStatus.FETCHING
 
     def _record_commit_event(
         self,
@@ -798,6 +932,16 @@ def _barrier_to_json(barrier: ReadyBarrierResult) -> dict[str, Any]:
         "all_required_blocks_ready": barrier.all_required_blocks_ready,
         "missing_blocks": [_range_to_json(item) for item in barrier.missing_blocks],
         "sync_ssd_miss_total": barrier.sync_ssd_miss_total,
+    }
+
+
+def _classification_counts(classification: KVClassification) -> dict[str, int]:
+    return {
+        "ready": len(classification.ready),
+        "cold": len(classification.cold),
+        "fetching": len(classification.fetching),
+        "missing": len(classification.missing),
+        "mismatch": len(classification.mismatch),
     }
 
 

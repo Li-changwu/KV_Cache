@@ -13,6 +13,7 @@ def _payload(
     prefix_id: str = "session-a",
     prefix_end: int = 64,
     prepass_deadline_ms: float | None = None,
+    model_fingerprint: str = "/root/models/Qwen2.5-14B-Instruct",
 ) -> dict:
     payload = {
         "request_id": request_id,
@@ -21,7 +22,7 @@ def _payload(
         "decode_sla_ms": 12_000,
         "admission_window_ms": 12_000,
         "correctness_key": {
-            "model_fingerprint": "/root/models/Qwen2.5-14B-Instruct",
+            "model_fingerprint": model_fingerprint,
             "tokenizer_fingerprint": "qwen2.5-tokenizer",
             "rope_config": "native-32768",
             "dtype": "bf16",
@@ -124,6 +125,9 @@ def test_prepass_restores_cold_prefix_before_online_admit(tmp_path):
     body = prepass.json()
     assert body["status"] == "READY"
     assert body["ready_before_request"] is True
+    assert body["classification"]["cold"][0]["prefix_id"] == "session-a"
+    assert body["classification"]["cold"][0]["status"] == "COLD"
+    assert body["classification_counts"]["cold"] == 1
     assert body["restore_results"][0]["status"] == "COMPLETED"
     assert admitted.json()["decision"] == "ADMIT"
     assert admitted.json()["ready_barrier"]["all_required_blocks_ready"] is True
@@ -158,13 +162,60 @@ def test_async_prepass_queues_restore_without_marking_ready_until_advanced(tmp_p
     client = _create_client_with_cold_prefix(tmp_path, async_prefetch=True)
 
     prepass = client.post("/prepass", json=_payload("prepass-r1"))
+    second_prepass = client.post("/prepass", json=_payload("prepass-r2"))
     before_advance = client.post("/admit", json=_payload("online-before"))
     advanced = client.post("/prefetch/advance", json={"max_ready_ms": 12_000.0})
     after_advance = client.post("/admit", json=_payload("online-after"))
 
     assert prepass.json()["status"] == "QUEUED"
     assert prepass.json()["ready_before_request"] is False
+    assert prepass.json()["classification"]["cold"][0]["prefix_id"] == "session-a"
     assert prepass.json()["restore_results"][0]["status"] == "QUEUED"
+    assert second_prepass.json()["classification"]["fetching"][0]["prefix_id"] == "session-a"
+    assert second_prepass.json()["classification_counts"]["fetching"] == 1
     assert before_advance.json()["decision"] == "DELAY"
     assert advanced.json()["completed"][0]["status"] == "COMPLETED"
     assert after_advance.json()["decision"] == "ADMIT"
+
+
+def test_prepass_classifies_missing_and_correctness_mismatch_sets(tmp_path):
+    app = create_app(
+        M3SidecarConfig(
+            model_id="/root/models/Qwen2.5-14B-Instruct",
+            hbm_capacity_tokens=65_000,
+            dram_capacity_tokens=1_000_000,
+            ssd_capacity_tokens=8_000_000,
+            kv_bytes_per_token=196_608,
+            h2d_gbps=25.0,
+            storage_gbps=8.8,
+            decision_log_path=tmp_path / "decisions.jsonl",
+        )
+    )
+    runtime = app.state.runtime
+    old_response = runtime.admit_from_payload(
+        _payload("commit-old", token_count=64, model_fingerprint="old-model")
+    )
+    runtime.control_plane.commit_request(
+        runtime.responses[old_response["request_id"]],
+        prefix_id="session-a",
+        token_end=64,
+        tier="DRAM",
+        ready=True,
+    )
+    client = TestClient(app)
+
+    mismatch = client.post(
+        "/prepass",
+        json=_payload("mismatch-r1", model_fingerprint="new-model"),
+    )
+    missing = client.post(
+        "/prepass",
+        json=_payload("missing-r1", prefix_id="session-missing"),
+    )
+
+    assert mismatch.json()["decision_after_prepass"] == "REJECT"
+    assert mismatch.json()["classification"]["mismatch"][0]["prefix_id"] == "session-a"
+    assert mismatch.json()["classification_counts"]["mismatch"] == 1
+    assert missing.json()["decision_after_prepass"] == "ADMIT"
+    assert missing.json()["classification"]["missing"][0]["prefix_id"] == "session-missing"
+    assert missing.json()["classification_counts"]["missing"] == 1
