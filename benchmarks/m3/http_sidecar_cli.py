@@ -38,7 +38,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--cold-backend",
         default="local_posix",
-        choices=["local_posix", "3fs_posix"],
+        choices=["local_posix", "3fs_posix", "packed_v1"],
     )
     parser.add_argument("--async-prefetch", action="store_true")
     parser.add_argument("--dry-run", action="store_true")

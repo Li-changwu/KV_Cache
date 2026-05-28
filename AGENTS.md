@@ -60,15 +60,17 @@ P0 tasks must come before additional feature work:
 - Define and run M3.11 baseline readiness matrix for B0-B5: full prefill, APC hot/restart, DRAM-ready reuse, naive cold restore, current Anti-Caching.
 - Extend online matrix from 16/64/128/256 to 512/2K/8K/16K/32K on Qwen2.5-14B.
 - Introduce persistent session lineage and committed KV range lifecycle for multi-turn append.
-- Implement a real KV PrePass that enumerates required historical KV ranges and returns ready/cold/missing sets.
+- Implement a real KV PrePass that enumerates required historical KV ranges and returns `gpu_ready/cpu_ready/ssd_cold/fetching/loading/missing/mismatch` sets.
 - Replace per-layer cold files with packed cold object / extent layout sufficient for 32K-scale restore experiments.
 
 ## Current Stage: M3.14
 
-- The next P0 implementation unit is `KV Evicted Index`: a CPU-resident metadata index that classifies required historical KV as `READY`, `COLD`, `FETCHING`, `MISSING`, or `MISMATCH` before a request enters vLLM.
+- The next P0 implementation unit is `KV Evicted Index`: a CPU-resident metadata index that classifies required historical KV as `GPU_READY`, `CPU_READY`, `SSD_COLD`, `FETCHING`, `LOADING`, `MISSING`, or `MISMATCH` before a request enters vLLM.
 - The paired P0 data-plane unit is `Packed Cold Object`: cold KV on SSD/3FS should become object/extent-addressable instead of many per-layer files.
 - Map database Anti-Cache carefully: Evicted Table becomes the in-memory KV index; Block Table becomes packed cold objects; pre-pass becomes control-plane KV PrePass; abort/retry becomes `DELAY`, async restore, verify, and re-admit.
 - Do not treat SSD/3FS as slow main memory. SSD/3FS only holds cold/persistent KV; CPU/HBM readiness is required before Prefill reuse or Decode execution.
+- Keep the GPU/CPU/SSD distinction explicit: `GPU_READY` means HBM resident and execution-ready; `CPU_READY` means restored and verified in host memory but still requires CPU->GPU loading; `SSD_COLD` means not online-admissible until SSD/3FS->CPU restore completes.
+- Do not collapse SSD->CPU restore and CPU->GPU load into one queue. Restore is Anti-Cache recovery; load is execution preparation.
 - Real 3FS executor work remains P1 until `KV Evicted Index`, PrePass classification sets, and packed-object restore evidence are in place.
 
 P1 tasks follow only after P0 gives evidence:

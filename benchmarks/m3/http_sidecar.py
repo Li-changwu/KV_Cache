@@ -106,6 +106,7 @@ class SidecarRuntime:
         self.prefetch_deadline_miss_total = 0
         self.prepass_requests_total = 0
         self.prepass_ready_total = 0
+        self.cpu_ready_not_gpu_ready_total = 0
         self.tensor_store = (
             KVTensorStore(config.tensor_store_path, config.tensor_store_block_size)
             if config.tensor_store_path
@@ -308,6 +309,10 @@ class SidecarRuntime:
         self.prepass_requests_total += 1
         if plan.ready_before_request:
             self.prepass_ready_total += 1
+        load_readiness = self._load_readiness_summary(classification)
+        self.cpu_ready_not_gpu_ready_total += int(
+            load_readiness["cpu_ready_not_gpu_ready_count"]
+        )
         body = {
             **plan.to_json(),
             "request_id": request.request_id,
@@ -320,6 +325,7 @@ class SidecarRuntime:
             ],
             "classification": classification.to_json(),
             "classification_counts": _classification_counts(classification),
+            "load_readiness": load_readiness,
             "restore_results": restore_results,
             "errors": errors,
             "ready_barrier": _barrier_to_json(barrier),
@@ -378,6 +384,8 @@ class SidecarRuntime:
                 f"prepass_requests_total {self.prepass_requests_total}",
                 "# TYPE prepass_ready_total counter",
                 f"prepass_ready_total {self.prepass_ready_total}",
+                "# TYPE cpu_ready_not_gpu_ready_total counter",
+                f"cpu_ready_not_gpu_ready_total {self.cpu_ready_not_gpu_ready_total}",
             ]
         )
         if self.prefetch_queue is not None:
@@ -422,6 +430,28 @@ class SidecarRuntime:
                 )
             )
         return self.kv_index.classify_required(required)
+
+    def _load_readiness_summary(
+        self,
+        classification: KVClassification,
+    ) -> dict[str, float | int]:
+        cpu_ready_tokens = sum(
+            item.token_end - item.token_start for item in classification.cpu_ready
+        )
+        expected_h2d_load_bytes = cpu_ready_tokens * self.config.kv_bytes_per_token
+        estimated_h2d_load_ms = 0.0
+        if expected_h2d_load_bytes and self.config.h2d_gbps > 0:
+            estimated_h2d_load_ms = (
+                expected_h2d_load_bytes
+                / (self.config.h2d_gbps * 1_000_000_000)
+                * 1000.0
+            )
+        return {
+            "cpu_ready_not_gpu_ready_count": len(classification.cpu_ready),
+            "cpu_ready_tokens": cpu_ready_tokens,
+            "expected_h2d_load_bytes": expected_h2d_load_bytes,
+            "estimated_h2d_load_ms": round(estimated_h2d_load_ms, 3),
+        }
 
     def _sync_index_from_control_plane(
         self,
@@ -937,9 +967,13 @@ def _barrier_to_json(barrier: ReadyBarrierResult) -> dict[str, Any]:
 
 def _classification_counts(classification: KVClassification) -> dict[str, int]:
     return {
+        "gpu_ready": len(classification.gpu_ready),
+        "cpu_ready": len(classification.cpu_ready),
+        "ssd_cold": len(classification.ssd_cold),
         "ready": len(classification.ready),
         "cold": len(classification.cold),
         "fetching": len(classification.fetching),
+        "loading": len(classification.loading),
         "missing": len(classification.missing),
         "mismatch": len(classification.mismatch),
     }

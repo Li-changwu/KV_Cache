@@ -1538,3 +1538,111 @@
   - `pytest tests/m3/test_prepass_planner.py -q`：先红灯缺少分类字段，补实现后 `3 passed in 1.55s`。
   - `python -m py_compile benchmarks/m3/kv_evicted_index.py benchmarks/m3/http_sidecar.py`：通过。
   - `pytest tests/m3/test_kv_evicted_index.py tests/m3/test_prepass_planner.py tests/m3/test_prepass_planner_unit.py tests/m3/test_http_sidecar.py tests/m3/test_prefetch_queue.py -q`：`35 passed in 3.60s`。
+
+### 阶段 M3.14-B2：GPU/CPU/SSD 三级状态语义修正
+- **状态：** complete
+- 时间：2026-05-28T04:12:00Z
+- 执行的操作：
+  - 根据用户追问重新审视上一版 `READY/COLD` 分类，确认它会把 `HBM ready` 与 `CPU/DRAM ready` 混在一起，无法完整表达三级存储调度。
+  - 按 TDD 扩展 `tests/m3/test_kv_evicted_index.py`，要求 HBM -> `GPU_READY`、DRAM/CPU -> `CPU_READY`、SSD/NVME/3FS -> `SSD_COLD`，并新增 `mark_loading()` 表示 CPU->GPU load 进行中。
+  - 扩展 `tests/m3/test_prepass_planner.py`，要求 `/prepass` 输出 `gpu_ready/cpu_ready/ssd_cold/fetching/loading/missing/mismatch` 细分集合，同时保留 `ready/cold` 兼容汇总。
+  - 修改 `benchmarks/m3/kv_evicted_index.py`：新增 `GPU_READY`、`CPU_READY`、`SSD_COLD`、`LOADING` 状态；`READY` 和 `COLD` 不再作为新逻辑主状态，而由分类集合做兼容汇总。
+  - 修改 `benchmarks/m3/http_sidecar.py`：`classification_counts` 增加 `gpu_ready`、`cpu_ready`、`ssd_cold`、`loading`。
+  - 更新 `AGENTS.md`、`task_plan.md`、`findings.md` 和 `progress.md`，把下一步方案修正为三级状态机，而不是二分 ready/cold。
+- 关键结果：
+  - `GPU_READY`：KV 已在 HBM，可视为执行 ready。
+  - `CPU_READY`：KV 已在 CPU/DRAM 且校验通过，但还需要 CPU->GPU load；不能再和 `GPU_READY` 混为一谈。
+  - `SSD_COLD`：KV 在 SSD/3FS 冷区或持久化层，必须先 SSD->CPU restore。
+  - `FETCHING`：SSD/3FS->CPU restore 进行中。
+  - `LOADING`：CPU/DRAM->GPU/HBM load 进行中。
+  - `ready` 与 `cold` 字段继续保留为兼容汇总：`ready = gpu_ready + cpu_ready`，`cold = ssd_cold`。
+- 验证：
+  - `pytest tests/m3/test_kv_evicted_index.py tests/m3/test_prepass_planner.py -q`：先红灯 8 个失败，补实现后 `13 passed in 1.63s`。
+
+### 阶段 M3.14-B3：CPU_READY -> GPU_READY load readiness 观测
+- **状态：** complete
+- 时间：2026-05-28T05:02:00Z
+- 执行的操作：
+  - 在 B2 三级状态修正基础上继续推进最小 B3，不进入 attention kernel 或 packed object。
+  - 按 TDD 新增 `tests/m3/test_prepass_planner.py::test_prepass_reports_cpu_ready_h2d_load_budget`，先观察红灯：`KeyError: 'load_readiness'`。
+  - 修改 `benchmarks/m3/http_sidecar.py`，为 `/prepass` 响应新增 `load_readiness` 字段。
+  - 根据 `classification.cpu_ready` 计算 `cpu_ready_not_gpu_ready_count`、`cpu_ready_tokens`、`expected_h2d_load_bytes`、`estimated_h2d_load_ms`。
+  - 在 `/metrics` 中新增 `cpu_ready_not_gpu_ready_total`，用于观测 CPU 已 ready 但 GPU 尚未 ready 的历史 KV。
+  - 验证并保留 `mark_ready()` 的状态收口：CPU->GPU load 完成并标记 HBM 后会清理 `loading_request_id`，因此 `LOADING -> GPU_READY` 可以正确闭合。
+- 关键结果：
+  - 对 64 tokens、Qwen2.5-14B 每 token KV `196608` bytes、H2D `25GB/s` 的 CPU_READY 前缀，PrePass 估算 `expected_h2d_load_bytes=12582912`，`estimated_h2d_load_ms=0.503`。
+  - 当前 B3 仍主要是观测口径，不是完整在线 GPU residency 调度；后续还要把真实 connector load 完成事件回写到索引。
+- 验证：
+  - `pytest tests/m3/test_prepass_planner.py::test_prepass_reports_cpu_ready_h2d_load_budget -q`：先红灯缺少 `load_readiness`，补实现后 `1 passed in 1.69s`。
+  - `pytest tests/m3/test_kv_evicted_index.py::test_mark_ready_after_loading_promotes_range_to_gpu_ready -q`：先红灯 `LOADING` 未提升为 `GPU_READY`，补实现后 `1 passed in 1.26s`。
+
+### 阶段 M3.14-C：Packed Cold Object v1
+- **状态：** complete
+- 时间：2026-05-28T05:47:00Z
+- 执行的操作：
+  - 按规划推进 `Packed Cold Object v1`，第一版选择 layer-major packed layout，保留 extent/offset 元数据，暂不做 extent-major partial restore。
+  - 按 TDD 新增 `tests/m3/test_packed_cold_object.py`，先观察红灯：`ImportError: cannot import name 'PackedColdTierAdapter'`。
+  - 在 `benchmarks/m3/cold_tier.py` 新增 `PackedColdTierAdapter`，backend 名为 `packed_v1`。
+  - `packed_v1` demote 会把每层 safetensors 文件按层顺序拼入 `packed_object.bin`，写出 `packed_manifest.json`，并删除热目录中的 per-layer 文件。
+  - `packed_v1` restore 会根据 `offset_table` 从 `packed_object.bin` 切片恢复每层 safetensors 文件，并做每层 checksum 校验。
+  - `build_cold_tier_adapter()` 支持 `packed_v1` / `local_packed_v1`。
+  - 将 `packed_v1` 加入 `run_cold_tier_adapter_bench.py`、`http_sidecar_cli.py`、`run_tier_migration_smoke.py`、`run_reuse_smoke_matrix.py`、`run_baseline_readiness_matrix.py` 的 `--cold-backend` choices。
+  - 新增 cold-tier adapter benchmark 测试，验证 `--cold-backend packed_v1` 能跑通并生成 packed object。
+- 关键结果：
+  - packed cold object 目录现在只需要 `packed_object.bin` + `packed_manifest.json`，不再在冷区保留每层 safetensors 文件。
+  - `KVBlockManifest.offset_table` 中每层都记录 `file_name=packed_object.bin`、`original_file_name`、`offset`、`size_bytes`、`checksum`、`packed_layout=packed_v1`。
+  - packed object 被篡改导致 size/checksum mismatch 时，restore 会失败，manifest 保持 cold/not-ready。
+  - 该实现仍是 local POSIX packed layout，不是 3FS 原生 packed object；M3.14-D 需要用它和 per-layer `local_posix` 做 2K/8K 对比。
+- 验证：
+  - `pytest tests/m3/test_packed_cold_object.py -q`：先红灯缺少 adapter，补实现后 `3 passed in 1.28s`。
+  - `pytest tests/m3/test_packed_cold_object.py tests/m3/test_cold_tier_adapter_bench.py -q`：`9 passed in 2.53s`。
+
+### 阶段 M3.14-D：2K/8K Packed vs Per-Layer Restore 对比
+- **状态：** complete
+- 时间：2026-05-28T06:28:00Z
+- 执行的操作：
+  - 按 TDD 新增 `tests/m3/test_packed_vs_per_layer_bench.py`，先观察红灯：`ModuleNotFoundError: No module named 'benchmarks.m3.run_packed_vs_per_layer_bench'`。
+  - 新增 `benchmarks/m3/run_packed_vs_per_layer_bench.py`，复用已有 `run_cold_tier_adapter_bench.py`，同一命令生成 `local_posix` 与 `packed_v1` 对比。
+  - 输出 aggregate CSV/JSON/Markdown：`packed_vs_per_layer_comparison.csv`、`packed_vs_per_layer_summary.json`、`packed_vs_per_layer_report.md`。
+  - 补充 by-token 输出：`packed_vs_per_layer_by_token.csv`，避免 aggregate 掩盖 2K/8K 差异。
+  - 运行正式 2K/8K 小矩阵：`python benchmarks/m3/run_packed_vs_per_layer_bench.py --result-dir results/m3_14_packed_vs_per_layer --prefix-tokens 2048 8192 --repeats 3 --queue-depth 1 --profile qwen25_14b_tiny`。
+- 关键结果：
+  - 结果目录：`results/m3_14_packed_vs_per_layer/`。
+  - aggregate：`local_posix` restore p50/p95/p99 为 `153.920/257.851/260.170ms`，effective restore p50 `517.004MiB/s`。
+  - aggregate：`packed_v1` restore p50/p95/p99 为 `315.211/531.195/531.347ms`，effective restore p50 `274.663MiB/s`。
+  - `packed_v1` cold data files 从 24 降到 6，但 restore p95 比 per-layer 增加 `273.344ms`。
+  - by-token：2K local/packed restore p95 为 `60.637ms` vs `102.856ms`；8K local/packed restore p95 为 `259.590ms` vs `531.309ms`。
+  - 结论：当前 packed_v1 证明了文件数减少和接口可用，但没有证明 restore 更快；不能据此进入 16K/32K gate matrix。
+- 下一步：
+  - 进入 M3.14-E：优化 packed restore 数据面，避免 Python `read_bytes()` / bytes 拼接和二次切片开销，或实现更接近生产路径的顺序读/批量 pread/extent-major restore。
+- 验证：
+  - `pytest tests/m3/test_packed_vs_per_layer_bench.py -q`：先红灯缺少 runner，补实现后 `2 passed in 2.65s`。
+  - 正式矩阵命令退出码 0，并生成 `packed_vs_per_layer_summary.json` / `packed_vs_per_layer_by_token.csv` / `packed_vs_per_layer_report.md`。
+
+### 阶段 M3.14-E：Packed Restore 数据面优化
+- **状态：** complete
+- 时间：2026-05-28T07:18:00Z
+- 执行的操作：
+  - 继续 M3.14-D 发现的问题：初始 packed_v1 虽减少 cold data files，但因为 Python `read_bytes()`、整段 bytes 切片和重复 checksum，restore p95 明显慢于 per-layer。
+  - 将 packed demote 改为 chunk streaming append，每层写入时同步计算 extent checksum，`offset_table` 与 `packed_manifest.json` 记录 `copy_mode=streaming`。
+  - 将 packed restore 改为按 extent streaming copy，不再把整个 extent 一次性读入内存后再写出。
+  - 将 `PackedColdTierAdapter.summarize()` 改为 fast manifest path：当 `packed_object.bin` 实际大小与 manifest 记录一致时，直接复用 manifest checksum；大小不一致时返回 `sha256:size-mismatch:<actual_size>` 触发上层 checksum mismatch。
+  - 按 TDD 新增回归测试，阻止 demote 收尾阶段在 streaming append 后重新以读模式打开 `packed_object.bin`；红灯确认 `_summarize_from_offsets()` 会二次读 packed object 后，改为用 append 阶段已记录的 extent checksum 组合 manifest checksum。
+  - 运行 2K/8K 小矩阵 r3：`python benchmarks/m3/run_packed_vs_per_layer_bench.py --result-dir results/m3_14_packed_vs_per_layer_fastmanifest --prefix-tokens 2048 8192 --repeats 3 --queue-depth 1 --profile qwen25_14b_tiny`。
+  - 去掉 demote summary 二次读后，再运行 r5：`python benchmarks/m3/run_packed_vs_per_layer_bench.py --result-dir results/m3_14_packed_vs_per_layer_streaming_summary_r5 --prefix-tokens 2048 8192 --repeats 5 --queue-depth 1 --profile qwen25_14b_tiny`。
+- 关键结果：
+  - r3 fastmanifest 结果：local_posix restore p50/p95/p99 为 `158.667/254.746/255.478ms`，packed_v1 为 `143.334/233.673/235.484ms`；packed restore p95 delta `-21.073ms`，cold data file count delta `-18`。
+  - r5 streaming-summary 结果：local_posix restore p50/p95/p99 为 `216.930/283.665/287.823ms`，packed_v1 为 `145.103/225.144/225.181ms`；packed restore p95 delta `-58.521ms`，cold data files 从 `40` 降到 `10`。
+  - r5 by-token：2K local/packed restore p95 为 `159.497ms` vs `66.766ms`；8K local/packed restore p95 为 `286.552ms` vs `225.169ms`。
+  - 谨慎结论：packed_v1 已从“功能可用但性能明显落后”变成“local POSIX 小矩阵中可与 per-layer 打平或胜出”。这支持继续进入 8K/16K gate，但仍不能声称真实 3FS 或生产 executor 性能优势。
+- 修改文件：
+  - `benchmarks/m3/cold_tier.py`
+  - `tests/m3/test_packed_cold_object.py`
+  - `task_plan.md`
+  - `findings.md`
+  - `progress.md`
+  - `docs/specs/m3_14_kv_evicted_index_and_packed_object.md`
+- 验证：
+  - `pytest tests/m3/test_packed_cold_object.py::test_packed_adapter_builds_manifest_checksum_from_extent_metadata -q`：先红灯命中 packed object 二次读，修复后 `1 passed in 1.20s`。
+  - `pytest tests/m3/test_packed_cold_object.py tests/m3/test_packed_vs_per_layer_bench.py tests/m3/test_cold_tier_adapter_bench.py -q`：`12 passed in 3.95s`。
+  - `python -m py_compile benchmarks/m3/cold_tier.py benchmarks/m3/run_packed_vs_per_layer_bench.py`：通过。

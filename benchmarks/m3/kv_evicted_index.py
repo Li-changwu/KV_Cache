@@ -10,6 +10,10 @@ from benchmarks.m3.tensor_store import KVBlockManifest
 
 
 class KVRangeStatus(StrEnum):
+    GPU_READY = "GPU_READY"
+    CPU_READY = "CPU_READY"
+    SSD_COLD = "SSD_COLD"
+    LOADING = "LOADING"
     READY = "READY"
     COLD = "COLD"
     FETCHING = "FETCHING"
@@ -17,7 +21,9 @@ class KVRangeStatus(StrEnum):
     MISMATCH = "MISMATCH"
 
 
-READY_TIERS = {"HBM", "DRAM", "CPU"}
+GPU_READY_TIERS = {"HBM"}
+CPU_READY_TIERS = {"DRAM", "CPU"}
+READY_TIERS = GPU_READY_TIERS | CPU_READY_TIERS
 COLD_TIERS = {"SSD", "NVME", "LOCAL_NVME", "THREE_FS", "3FS", "3FS_POSIX"}
 
 
@@ -48,6 +54,7 @@ class KVIndexEntry:
     last_access_epoch: int = 0
     access_count: int = 0
     fetching_request_id: str | None = None
+    loading_request_id: str | None = None
 
     @property
     def tokens(self) -> int:
@@ -69,17 +76,25 @@ class KVLookupResult:
 
 @dataclass(frozen=True)
 class KVClassification:
+    gpu_ready: tuple[KVLookupResult, ...]
+    cpu_ready: tuple[KVLookupResult, ...]
+    ssd_cold: tuple[KVLookupResult, ...]
     ready: tuple[KVLookupResult, ...]
     cold: tuple[KVLookupResult, ...]
     fetching: tuple[KVLookupResult, ...]
+    loading: tuple[KVLookupResult, ...]
     missing: tuple[KVLookupResult, ...]
     mismatch: tuple[KVLookupResult, ...]
 
     def to_json(self) -> dict[str, list[dict[str, Any]]]:
         return {
+            "gpu_ready": [_lookup_to_json(item) for item in self.gpu_ready],
+            "cpu_ready": [_lookup_to_json(item) for item in self.cpu_ready],
+            "ssd_cold": [_lookup_to_json(item) for item in self.ssd_cold],
             "ready": [_lookup_to_json(item) for item in self.ready],
             "cold": [_lookup_to_json(item) for item in self.cold],
             "fetching": [_lookup_to_json(item) for item in self.fetching],
+            "loading": [_lookup_to_json(item) for item in self.loading],
             "missing": [_lookup_to_json(item) for item in self.missing],
             "mismatch": [_lookup_to_json(item) for item in self.mismatch],
         }
@@ -170,7 +185,7 @@ class KVEvictedIndex:
         status = _status_for_entry(entry)
         cold_extents = (
             _select_extents(entry, token_start, token_end)
-            if status in {KVRangeStatus.COLD, KVRangeStatus.FETCHING}
+            if status in {KVRangeStatus.SSD_COLD, KVRangeStatus.COLD, KVRangeStatus.FETCHING}
             else []
         )
         return self._touch_result(
@@ -202,10 +217,16 @@ class KVEvictedIndex:
                 correctness_key=correctness_key,
             )
             buckets[result.status].append(result)
+        ready = buckets[KVRangeStatus.GPU_READY] + buckets[KVRangeStatus.CPU_READY]
+        cold = buckets[KVRangeStatus.SSD_COLD]
         return KVClassification(
-            ready=tuple(buckets[KVRangeStatus.READY]),
-            cold=tuple(buckets[KVRangeStatus.COLD]),
+            gpu_ready=tuple(buckets[KVRangeStatus.GPU_READY]),
+            cpu_ready=tuple(buckets[KVRangeStatus.CPU_READY]),
+            ssd_cold=tuple(buckets[KVRangeStatus.SSD_COLD]),
+            ready=tuple(ready),
+            cold=tuple(cold),
             fetching=tuple(buckets[KVRangeStatus.FETCHING]),
+            loading=tuple(buckets[KVRangeStatus.LOADING]),
             missing=tuple(buckets[KVRangeStatus.MISSING]),
             mismatch=tuple(buckets[KVRangeStatus.MISMATCH]),
         )
@@ -228,7 +249,9 @@ class KVEvictedIndex:
         if result.entry is None or result.status in {
             KVRangeStatus.MISSING,
             KVRangeStatus.MISMATCH,
-            KVRangeStatus.READY,
+            KVRangeStatus.GPU_READY,
+            KVRangeStatus.CPU_READY,
+            KVRangeStatus.LOADING,
         }:
             return result
         updated = replace(
@@ -246,6 +269,39 @@ class KVEvictedIndex:
             token_end=int(token_end),
             entry=updated,
             cold_extents=_select_extents(updated, int(token_start), int(token_end)),
+        )
+
+    def mark_loading(
+        self,
+        *,
+        prefix_id: str,
+        token_start: int,
+        token_end: int,
+        correctness_key: dict[str, Any],
+        request_id: str,
+    ) -> KVLookupResult:
+        result = self.lookup_required(
+            prefix_id=prefix_id,
+            token_start=token_start,
+            token_end=token_end,
+            correctness_key=correctness_key,
+        )
+        if result.entry is None or result.status != KVRangeStatus.CPU_READY:
+            return result
+        updated = replace(
+            result.entry,
+            tier="LOADING",
+            ready=False,
+            loading_request_id=str(request_id),
+            last_access_epoch=self._next_epoch(),
+        )
+        self._append(updated)
+        return KVLookupResult(
+            status=KVRangeStatus.LOADING,
+            prefix_id=prefix_id,
+            token_start=int(token_start),
+            token_end=int(token_end),
+            entry=updated,
         )
 
     def mark_ready(
@@ -273,11 +329,12 @@ class KVEvictedIndex:
             tier=_normalize_tier(target_tier),
             ready=True,
             fetching_request_id=None,
+            loading_request_id=None,
             last_access_epoch=self._next_epoch(),
         )
         self._append(updated)
         return KVLookupResult(
-            status=KVRangeStatus.READY,
+            status=_status_for_entry(updated),
             prefix_id=prefix_id,
             token_start=int(token_start),
             token_end=int(token_end),
@@ -322,7 +379,7 @@ class KVEvictedIndex:
         )
         self._append(entry)
         return KVLookupResult(
-            status=KVRangeStatus.COLD,
+            status=KVRangeStatus.SSD_COLD,
             prefix_id=prefix_id,
             token_start=int(token_start),
             token_end=int(token_end),
@@ -423,12 +480,16 @@ def _select_extents(
 
 def _status_for_entry(entry: KVIndexEntry) -> KVRangeStatus:
     tier = _normalize_tier(entry.tier)
+    if tier == "LOADING" or entry.loading_request_id:
+        return KVRangeStatus.LOADING
     if tier == "FETCHING" or entry.fetching_request_id:
         return KVRangeStatus.FETCHING
-    if entry.ready and tier in READY_TIERS:
-        return KVRangeStatus.READY
+    if entry.ready and tier in GPU_READY_TIERS:
+        return KVRangeStatus.GPU_READY
+    if entry.ready and tier in CPU_READY_TIERS:
+        return KVRangeStatus.CPU_READY
     if tier in COLD_TIERS or entry.cold_uri or entry.object_id or entry.extents:
-        return KVRangeStatus.COLD
+        return KVRangeStatus.SSD_COLD
     return KVRangeStatus.MISSING
 
 
@@ -499,8 +560,10 @@ def _tier_rank(tier: str) -> int:
         return 5
     if normalized in {"DRAM", "CPU"}:
         return 4
-    if normalized == "FETCHING":
+    if normalized == "LOADING":
         return 3
-    if normalized in COLD_TIERS:
+    if normalized == "FETCHING":
         return 2
-    return 1
+    if normalized in COLD_TIERS:
+        return 1
+    return 0

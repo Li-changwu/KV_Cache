@@ -441,6 +441,22 @@
 - M3.14-B 已把 `/prepass` 响应升级为分类集合：新增 `classification` 与 `classification_counts` 字段，包含 `ready/cold/fetching/missing/mismatch` 五类。旧字段如 `status`、`ready_before_request`、`restore_results` 保持不变，避免破坏已有实验脚本。
 - sidecar 现在维护一个 runtime 级 `KVEvictedIndex`，从控制面 commit、tensor store manifest、同步/异步 restore 完成事件同步元数据。该索引仍是增强层，不强行替代现有 `KVManifest`，这是为了降低 M3.14-B 对在线路径的侵入。
 - 异步 PrePass 的第二次请求现在能看到 `FETCHING` 分类，而不是再次把同一个 cold prefix 当作普通 cold 任务入队。这对应数据库 Anti-Cache 中 evicted tuple 进入 pre-pass 后避免重复 fetch 同一 block 的思想。
+- 2026-05-28 追问修正：上一版 `READY/COLD` 对 Anti-Caching 的 SSD 冷区判断够用，但没有充分表达 GPU/CPU/SSD 三级调度。必须把 `READY` 拆成 `GPU_READY` 与 `CPU_READY`：前者表示 KV 已在 HBM、可直接进入执行；后者表示 KV 已经从 SSD 恢复到 CPU/DRAM 并校验，但仍需要 CPU->GPU load。
+- 同理，`COLD` 应精确为 `SSD_COLD`：它表示 KV 在 SSD/3FS 冷区或持久化层，不能直接进入 vLLM 执行。`FETCHING` 表示 SSD/3FS->CPU restore 进行中；新增 `LOADING` 表示 CPU/DRAM->GPU/HBM load 进行中。这样 SSD->CPU 与 CPU->GPU 两条路径不会被混成一个“ready”。
+- 修正后的 PrePass/Index 输出同时保留兼容汇总字段 `ready` 与 `cold`，但新研究和调度逻辑应使用 `gpu_ready/cpu_ready/ssd_cold/fetching/loading/missing/mismatch`。下一步整体方案必须增加 CPU_READY->GPU_READY 的 load readiness 观测口径，否则会低估 online TTFT 与 decode ready 风险。
+- M3.14-B3 已补上第一版 CPU_READY->GPU_READY load readiness 观测：`/prepass` 输出 `load_readiness`，包括 `cpu_ready_not_gpu_ready_count`、`cpu_ready_tokens`、`expected_h2d_load_bytes` 和 `estimated_h2d_load_ms`；`/metrics` 新增 `cpu_ready_not_gpu_ready_total`。这一步让 CPU_READY 的 H2D 代价显式进入控制面，但还没有完成真正的 GPU load 回写闭环。
+- 重新反思整体方案：当前系统已经从二分 ready/cold 变成三级状态可见，但还没有完成三级调度闭环。闭环还缺两件 P0：一是 packed cold object 降低 SSD/3FS->CPU restore 尾延迟；二是把 connector 的 CPU->GPU load 完成事件回写为 `GPU_READY`，并在 admission 中区分“可直接执行”和“需要执行前加载”。
+- M3.14-C 已实现 `packed_v1` cold-tier backend。第一版采用 layer-major packed object：每个 prefix 冷区目录中只有 `packed_object.bin` 和 `packed_manifest.json`，每层 safetensors 的字节范围以 `offset/size_bytes/checksum` 写入 manifest 和 `KVBlockManifest.offset_table`。这降低了冷区小文件数量，并为后续 extent-major/partial restore 保留 offset 接口。
+- `packed_v1` 已接入 `build_cold_tier_adapter()`、`KVTensorStore.demote_to_cold_object()` / `restore_from_cold_object()`、prefetch queue 和已有 cold-tier adapter benchmark 入口。CLI 的 `--cold-backend` 现在支持 `local_posix`、`3fs_posix`、`packed_v1`。当前 packed_v1 是 local POSIX packed layout，还不是 3FS 原生 packed object。
+- packed_v1 功能测试覆盖：demote 后热层文件被移除；冷区不再生成每层 safetensors 文件；restore 后原有 `load_layer()` 能读回两个 layer 的原始 KV；packed object 尺寸被篡改时 checksum mismatch 会失败且 manifest 保持 cold/not-ready。
+- M3.14-D 已完成 2K/8K `local_posix` vs `packed_v1` 对比，结果目录为 `results/m3_14_packed_vs_per_layer/`。本轮使用 `qwen25_14b_tiny` profile、4 layers、bf16、repeats=3、queue_depth=1。结论很明确：packed_v1 降低了冷区数据文件数，但当前实现没有降低 restore latency。
+- Aggregate 结果：`local_posix` restore p50/p95/p99 为 `153.920/257.851/260.170ms`，effective restore p50 `517.004MiB/s`；`packed_v1` restore p50/p95/p99 为 `315.211/531.195/531.347ms`，effective restore p50 `274.663MiB/s`。packed_v1 的 cold data files 从 24 降到 6，但 restore p95 增加 `273.344ms`。
+- 按 token 拆分：2K 下 local/packed restore p95 为 `60.637ms` vs `102.856ms`；8K 下 local/packed restore p95 为 `259.590ms` vs `531.309ms`。这说明当前 layer-major packed Python 实现的 read/write/copy 开销抵消了文件数收益，不能作为进入 16K/32K gate 的性能依据。
+- 下一步不应盲目进入 16K/32K，而应先做 M3.14-E：优化 packed restore 数据面，例如避免 `read_bytes()`/整段 bytes 拼接与二次切片、用更接近顺序读的 copy path、减少重复 checksum、或实现 extent-major/批量 pread。packed 方向仍有系统价值，但当前版本只是功能原型，不是性能可用实现。
+- M3.14-E 已修正 packed_v1 的主要 Python 数据面问题：demote 从 `read_bytes()/write` 改为 chunk streaming append；restore 从整段 bytes 切片改为按 extent streaming copy；restore 前的 `summarize()` 在 packed object 大小匹配 manifest 时直接复用 manifest checksum，不再重读整个 packed object；demote 收尾的 manifest checksum 也改为复用 append 阶段已计算的 extent checksum，不再二次读取 `packed_object.bin`。
+- 修正后第一轮 2K/8K r3 小矩阵在 `results/m3_14_packed_vs_per_layer_fastmanifest/` 显示 packed_v1 从“明显慢”变为“略优”：local restore p50/p95/p99 为 `158.667/254.746/255.478ms`，packed 为 `143.334/233.673/235.484ms`，packed restore p95 delta 为 `-21.073ms`，冷区数据文件数 delta 为 `-18`。
+- 进一步去掉 demote summary 二次读后，r5 小矩阵结果在 `results/m3_14_packed_vs_per_layer_streaming_summary_r5/`：local_posix restore p50/p95/p99 为 `216.930/283.665/287.823ms`，packed_v1 为 `145.103/225.144/225.181ms`，packed restore p95 delta 为 `-58.521ms`，cold data files 从 `40` 降到 `10`，effective restore p50 从 `442.556MiB/s` 提升到 `526.998MiB/s`。
+- 按 token 拆分的 r5 结果：2K local/packed restore p95 为 `159.497ms` vs `66.766ms`；8K local/packed restore p95 为 `286.552ms` vs `225.169ms`。这说明 packed_v1 数据面优化后已具备继续做 8K/16K gate 的价值，但结论仍受本地 POSIX、synthetic qwen25 tiny profile、Python safetensors restore 和小样本抖动限制，不能外推为真实 3FS/生产 executor 性能。
 
 ## 视觉/浏览器发现
 - 本轮尚未使用视觉或浏览器资料。

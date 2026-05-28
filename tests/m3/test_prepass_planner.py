@@ -125,8 +125,10 @@ def test_prepass_restores_cold_prefix_before_online_admit(tmp_path):
     body = prepass.json()
     assert body["status"] == "READY"
     assert body["ready_before_request"] is True
+    assert body["classification"]["ssd_cold"][0]["prefix_id"] == "session-a"
+    assert body["classification"]["ssd_cold"][0]["status"] == "SSD_COLD"
     assert body["classification"]["cold"][0]["prefix_id"] == "session-a"
-    assert body["classification"]["cold"][0]["status"] == "COLD"
+    assert body["classification_counts"]["ssd_cold"] == 1
     assert body["classification_counts"]["cold"] == 1
     assert body["restore_results"][0]["status"] == "COMPLETED"
     assert admitted.json()["decision"] == "ADMIT"
@@ -169,13 +171,112 @@ def test_async_prepass_queues_restore_without_marking_ready_until_advanced(tmp_p
 
     assert prepass.json()["status"] == "QUEUED"
     assert prepass.json()["ready_before_request"] is False
-    assert prepass.json()["classification"]["cold"][0]["prefix_id"] == "session-a"
+    assert prepass.json()["classification"]["ssd_cold"][0]["prefix_id"] == "session-a"
     assert prepass.json()["restore_results"][0]["status"] == "QUEUED"
     assert second_prepass.json()["classification"]["fetching"][0]["prefix_id"] == "session-a"
     assert second_prepass.json()["classification_counts"]["fetching"] == 1
     assert before_advance.json()["decision"] == "DELAY"
     assert advanced.json()["completed"][0]["status"] == "COMPLETED"
     assert after_advance.json()["decision"] == "ADMIT"
+
+
+def test_prepass_distinguishes_gpu_ready_and_cpu_ready_sets(tmp_path):
+    app = create_app(
+        M3SidecarConfig(
+            model_id="/root/models/Qwen2.5-14B-Instruct",
+            hbm_capacity_tokens=65_000,
+            dram_capacity_tokens=1_000_000,
+            ssd_capacity_tokens=8_000_000,
+            kv_bytes_per_token=196_608,
+            h2d_gbps=25.0,
+            storage_gbps=8.8,
+            decision_log_path=tmp_path / "decisions.jsonl",
+        )
+    )
+    runtime = app.state.runtime
+    for prefix_id, tier in [("gpu-prefix", "HBM"), ("cpu-prefix", "DRAM")]:
+        response = runtime.admit_from_payload(
+            _payload(f"commit-{prefix_id}", token_count=64, prefix_id=prefix_id)
+        )
+        runtime.control_plane.commit_request(
+            runtime.responses[response["request_id"]],
+            prefix_id=prefix_id,
+            token_end=64,
+            tier=tier,
+            ready=True,
+        )
+    client = TestClient(app)
+
+    body = client.post(
+        "/prepass",
+        json={
+            **_payload("prepass-tiered", prefix_id="gpu-prefix"),
+            "prefix_candidates": [
+                {
+                    "prefix_id": "gpu-prefix",
+                    "token_start": 0,
+                    "token_end": 64,
+                    "committed": True,
+                },
+                {
+                    "prefix_id": "cpu-prefix",
+                    "token_start": 0,
+                    "token_end": 64,
+                    "committed": True,
+                },
+            ],
+        },
+    ).json()
+
+    assert [item["prefix_id"] for item in body["classification"]["gpu_ready"]] == [
+        "gpu-prefix"
+    ]
+    assert [item["prefix_id"] for item in body["classification"]["cpu_ready"]] == [
+        "cpu-prefix"
+    ]
+    assert body["classification_counts"]["gpu_ready"] == 1
+    assert body["classification_counts"]["cpu_ready"] == 1
+    assert body["classification_counts"]["ready"] == 2
+
+
+def test_prepass_reports_cpu_ready_h2d_load_budget(tmp_path):
+    app = create_app(
+        M3SidecarConfig(
+            model_id="/root/models/Qwen2.5-14B-Instruct",
+            hbm_capacity_tokens=65_000,
+            dram_capacity_tokens=1_000_000,
+            ssd_capacity_tokens=8_000_000,
+            kv_bytes_per_token=196_608,
+            h2d_gbps=25.0,
+            storage_gbps=8.8,
+            decision_log_path=tmp_path / "decisions.jsonl",
+        )
+    )
+    runtime = app.state.runtime
+    response = runtime.admit_from_payload(
+        _payload("commit-cpu-prefix", token_count=64, prefix_id="cpu-prefix")
+    )
+    runtime.control_plane.commit_request(
+        runtime.responses[response["request_id"]],
+        prefix_id="cpu-prefix",
+        token_end=64,
+        tier="DRAM",
+        ready=True,
+    )
+    client = TestClient(app)
+
+    body = client.post(
+        "/prepass",
+        json=_payload("prepass-cpu-load", prefix_id="cpu-prefix"),
+    ).json()
+    metrics = client.get("/metrics").text
+
+    assert body["classification_counts"]["cpu_ready"] == 1
+    assert body["load_readiness"]["cpu_ready_not_gpu_ready_count"] == 1
+    assert body["load_readiness"]["cpu_ready_tokens"] == 64
+    assert body["load_readiness"]["expected_h2d_load_bytes"] == 12_582_912
+    assert body["load_readiness"]["estimated_h2d_load_ms"] == 0.503
+    assert "cpu_ready_not_gpu_ready_total 1" in metrics
 
 
 def test_prepass_classifies_missing_and_correctness_mismatch_sets(tmp_path):

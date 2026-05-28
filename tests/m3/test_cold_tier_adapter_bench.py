@@ -77,6 +77,40 @@ def test_cold_tier_adapter_bench_supports_3fs_posix_backend(tmp_path):
     assert events[1]["cold_backend"] == "3fs_posix"
 
 
+def test_cold_tier_adapter_bench_supports_packed_v1_backend(tmp_path):
+    result = run_cold_tier_adapter_bench(
+        ColdTierAdapterBenchConfig(
+            result_dir=tmp_path / "result",
+            cold_root=tmp_path / "packed",
+            cold_backend="packed_v1",
+            prefix_tokens=[16],
+            repeats=1,
+            layers=2,
+            block_size=16,
+            kv_heads=1,
+            head_dim=2,
+        )
+    )
+
+    assert result["status"] == "OK"
+    assert result["cold_backend"] == "packed_v1"
+    rows = list(csv.DictReader(Path(result["csv_path"]).open()))
+    assert rows[0]["cold_backend"] == "packed_v1"
+    assert rows[0]["checksum_status"] == "ok"
+    prefix_id = rows[0]["prefix_id"]
+    object_id = rows[0]["object_id"]
+    assert (tmp_path / "packed" / object_id / "packed_object.bin").exists()
+    assert (tmp_path / "packed" / object_id / "packed_manifest.json").exists()
+    events = [
+        json.loads(line)
+        for line in (Path(result["tensor_store"]) / prefix_id / "migration_events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert events[0]["cold_backend"] == "packed_v1"
+    assert events[1]["cold_backend"] == "packed_v1"
+
+
 def test_cold_tier_adapter_bench_records_queue_depth_batches(tmp_path):
     result = run_cold_tier_adapter_bench(
         ColdTierAdapterBenchConfig(

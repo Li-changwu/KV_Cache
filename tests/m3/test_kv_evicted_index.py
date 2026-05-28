@@ -64,11 +64,41 @@ def test_ready_cpu_or_hbm_range_is_classified_ready():
         correctness_key=correctness_key(),
     )
 
-    assert result.status == KVRangeStatus.READY
+    assert result.status == KVRangeStatus.CPU_READY
     assert result.entry is not None
     assert result.entry.tier == "DRAM"
     assert result.entry.ready is True
     assert result.cold_extents == []
+
+
+def test_gpu_cpu_and_ssd_are_classified_as_distinct_tiers():
+    index = KVEvictedIndex()
+    index.upsert_from_manifest(manifest(prefix_id="gpu", tier="HBM", ready=True))
+    index.upsert_from_manifest(manifest(prefix_id="cpu", tier="DRAM", ready=True))
+    index.upsert_from_manifest(manifest(prefix_id="ssd", tier="SSD", ready=False))
+
+    gpu = index.lookup_required(
+        prefix_id="gpu",
+        token_start=0,
+        token_end=64,
+        correctness_key=correctness_key(),
+    )
+    cpu = index.lookup_required(
+        prefix_id="cpu",
+        token_start=0,
+        token_end=64,
+        correctness_key=correctness_key(),
+    )
+    ssd = index.lookup_required(
+        prefix_id="ssd",
+        token_start=0,
+        token_end=64,
+        correctness_key=correctness_key(),
+    )
+
+    assert gpu.status == KVRangeStatus.GPU_READY
+    assert cpu.status == KVRangeStatus.CPU_READY
+    assert ssd.status == KVRangeStatus.SSD_COLD
 
 
 def test_ssd_not_ready_range_is_classified_cold_with_extent_locations():
@@ -97,7 +127,7 @@ def test_ssd_not_ready_range_is_classified_cold_with_extent_locations():
         correctness_key=correctness_key(),
     )
 
-    assert result.status == KVRangeStatus.COLD
+    assert result.status == KVRangeStatus.SSD_COLD
     assert result.entry is not None
     assert result.entry.object_id == "obj-session-a"
     assert result.entry.cold_uri == "file:///cold/obj-session-a"
@@ -200,16 +230,61 @@ def test_mark_ready_promotes_cold_or_fetching_range_to_ready_cpu_tier():
         target_tier="CPU",
     )
 
-    assert result.status == KVRangeStatus.READY
+    assert result.status == KVRangeStatus.CPU_READY
     assert result.entry is not None
     assert result.entry.tier == "CPU"
     assert result.entry.ready is True
     assert result.entry.fetching_request_id is None
 
 
-def test_classify_required_groups_ready_cold_fetching_missing_and_mismatch():
+def test_mark_loading_tracks_cpu_to_gpu_transfer_without_reclassifying_as_cold():
     index = KVEvictedIndex()
-    index.upsert_from_manifest(manifest(prefix_id="ready", tier="HBM", ready=True))
+    index.upsert_from_manifest(manifest(tier="DRAM", ready=True))
+
+    loading = index.mark_loading(
+        prefix_id="session-a",
+        token_start=0,
+        token_end=64,
+        correctness_key=correctness_key(),
+        request_id="h2d-r1",
+    )
+
+    assert loading.status == KVRangeStatus.LOADING
+    assert loading.entry is not None
+    assert loading.entry.loading_request_id == "h2d-r1"
+    assert loading.entry.tier == "LOADING"
+
+
+def test_mark_ready_after_loading_promotes_range_to_gpu_ready():
+    index = KVEvictedIndex()
+    index.upsert_from_manifest(manifest(tier="DRAM", ready=True))
+    index.mark_loading(
+        prefix_id="session-a",
+        token_start=0,
+        token_end=64,
+        correctness_key=correctness_key(),
+        request_id="h2d-r1",
+    )
+
+    ready = index.mark_ready(
+        prefix_id="session-a",
+        token_start=0,
+        token_end=64,
+        correctness_key=correctness_key(),
+        target_tier="HBM",
+    )
+
+    assert ready.status == KVRangeStatus.GPU_READY
+    assert ready.entry is not None
+    assert ready.entry.tier == "HBM"
+    assert ready.entry.ready is True
+    assert ready.entry.loading_request_id is None
+
+
+def test_classify_required_groups_gpu_cpu_ssd_fetching_loading_missing_and_mismatch():
+    index = KVEvictedIndex()
+    index.upsert_from_manifest(manifest(prefix_id="gpu", tier="HBM", ready=True))
+    index.upsert_from_manifest(manifest(prefix_id="cpu", tier="DRAM", ready=True))
     index.upsert_from_manifest(manifest(prefix_id="cold", tier="SSD", ready=False))
     index.upsert_from_manifest(manifest(prefix_id="fetching", tier="SSD", ready=False))
     index.mark_fetching(
@@ -219,22 +294,36 @@ def test_classify_required_groups_ready_cold_fetching_missing_and_mismatch():
         correctness_key=correctness_key(),
         request_id="restore-r1",
     )
+    index.upsert_from_manifest(manifest(prefix_id="loading", tier="DRAM", ready=True))
+    index.mark_loading(
+        prefix_id="loading",
+        token_start=0,
+        token_end=64,
+        correctness_key=correctness_key(),
+        request_id="h2d-r1",
+    )
     index.upsert_from_manifest(
         manifest(prefix_id="mismatch", key=correctness_key(model="old-model"))
     )
 
     grouped = index.classify_required(
         [
-            ("ready", 0, 64, correctness_key()),
+            ("gpu", 0, 64, correctness_key()),
+            ("cpu", 0, 64, correctness_key()),
             ("cold", 0, 64, correctness_key()),
             ("fetching", 0, 64, correctness_key()),
+            ("loading", 0, 64, correctness_key()),
             ("missing", 0, 64, correctness_key()),
             ("mismatch", 0, 64, correctness_key(model="new-model")),
         ]
     )
 
-    assert [item.prefix_id for item in grouped.ready] == ["ready"]
-    assert [item.prefix_id for item in grouped.cold] == ["cold"]
+    assert [item.prefix_id for item in grouped.gpu_ready] == ["gpu"]
+    assert [item.prefix_id for item in grouped.cpu_ready] == ["cpu"]
+    assert [item.prefix_id for item in grouped.ssd_cold] == ["cold"]
     assert [item.prefix_id for item in grouped.fetching] == ["fetching"]
+    assert [item.prefix_id for item in grouped.loading] == ["loading"]
     assert [item.prefix_id for item in grouped.missing] == ["missing"]
     assert [item.prefix_id for item in grouped.mismatch] == ["mismatch"]
+    assert [item.prefix_id for item in grouped.ready] == ["gpu", "cpu"]
+    assert [item.prefix_id for item in grouped.cold] == ["cold"]

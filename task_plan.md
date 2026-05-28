@@ -4,7 +4,7 @@
 充分理解 `1M_Tokens_KV_Cache_分层管理技术方案.md` 的研究问题、系统架构、关键机制与实现约束，并产出可沟通、可迭代的实施规划。
 
 ## 当前阶段
-阶段 M3.14 正在推进：项目主线已重新收敛为 **Persistent KV Anti-Caching for Multi-Turn Long-Context Serving**。M3.12 已经证明真实 vLLM + true cold object + PrePass 可以把 cold restore 移出在线请求路径，M3.13 已经量化了不同 prefix 长度所需的 restore lead time。现在根据数据库 Anti-Cache 的 Evicted Table / Block Table / pre-pass 机制，下一步必须把系统从“能预取一个 cold manifest”升级为“有内存常驻 KV 状态索引 + 打包式冷 KV 对象”的真正 Anti-Caching 结构。真实 3FS executor 仍属于 P1，不能替代 P0 的 KV Evicted Index 与 Packed Cold Object 证据链。
+阶段 M3.14 正在推进：项目主线已重新收敛为 **Persistent KV Anti-Caching for Multi-Turn Long-Context Serving**。M3.12 已经证明真实 vLLM + true cold object + PrePass 可以把 cold restore 移出在线请求路径，M3.13 已经量化了不同 prefix 长度所需的 restore lead time。当前必须先修正三级存储语义：HBM 是 `GPU_READY` 执行层，CPU/DRAM 是 `CPU_READY` 准备层，SSD/3FS 是 `SSD_COLD` 冷区和持久化层。M3.14 要把系统从“能预取一个 cold manifest”升级为“有内存常驻 KV 状态索引 + 打包式冷 KV 对象 + 明确 SSD->CPU restore 与 CPU->GPU load 边界”的真正 Anti-Caching 结构。真实 3FS executor 仍属于 P1，不能替代 P0 的三级状态索引与 Packed Cold Object 证据链。
 
 ## 当前优先级把关
 
@@ -14,9 +14,10 @@
 | P0 | 512/2K/8K/16K/32K 在线矩阵 | 当前 16/64/128/256 只能证明机制，不能证明长上下文服务有效 |
 | P0 | Persistent session lineage + committed KV ranges | 框架核心是多轮历史 KV 作为持久服务状态；没有它就只是 prefix cache/offload |
 | P0 | KV PrePass：枚举 required historical KV ranges | Anti-Caching 的根本是执行前知道 cold miss，而不是执行期发现 miss |
-| P0 | M3.14-A KV Evicted Index：内存常驻 KV 状态索引 | 借鉴 Anti-Cache Evicted Table，请求进入 GPU 前必须先知道所需 KV 在 HBM/CPU/SSD/FETCHING/MISSING 哪个状态 |
+| P0 | M3.14-A KV Evicted Index：内存常驻 KV 状态索引 | 借鉴 Anti-Cache Evicted Table，请求进入 GPU 前必须先知道所需 KV 是 GPU_READY、CPU_READY、SSD_COLD、FETCHING、LOADING、MISSING 还是 MISMATCH |
 | P0 | M3.13 PrePass lead-time planner 与 512/2K/8K 小矩阵 | B5 online TTFT 好看只在 restore 被提前隐藏时成立；必须量化需要多少提前量 |
-| P0 | M3.14-B PrePass 分类集合 | PrePass 必须返回 ready/cold/fetching/missing/mismatch sets，而不是只返回计数和 QUEUED/READY |
+| P0 | M3.14-B PrePass 分类集合 | PrePass 必须返回 gpu_ready/cpu_ready/ssd_cold/fetching/loading/missing/mismatch sets，而不是只返回计数和 QUEUED/READY |
+| P0 | M3.14-B2 CPU->GPU load readiness 边界 | CPU_READY 不等于 GPU_READY；必须显式建模 H2D load 预算，否则会低估在线 TTFT/Decode ready 风险 |
 | P0 | M3.14-C Packed Cold Object / extent layout | 对应 Anti-Cache Block Table；每层小文件无法支撑 32K/128K/1M，也无法与 KVDrive/3FS 做严肃对比 |
 | P1 | 生产级 restore executor：QD、pinned staging、H2D overlap、tail metrics | P0 证明有收益后，才值得优化真实数据面 |
 | P1 | 真实 3FS mount / 生产 SSD 校准 | 重要，但应服务于已被 P0 证明的系统路径 |
@@ -193,7 +194,7 @@
 - [x] P0：重跑 load-only 后 2K B3/B5 真机样本，并重建 B0/B1/B2/B3/B5 统一汇总
 - [ ] P0：扩展 512/2K/8K/16K/32K prefix 与 128/512/2K suffix 矩阵
 - [ ] P0：实现 persistent session lineage + committed KV range 生命周期，用于多轮 append / idle restore
-- [ ] P0：实现 KV PrePass，枚举本轮 required historical KV ranges，并输出 ready/cold/missing/restorable sets
+- [ ] P0：实现 KV PrePass，枚举本轮 required historical KV ranges，并输出 gpu_ready/cpu_ready/ssd_cold/fetching/loading/missing/mismatch sets
 - [ ] P0：实现 packed cold object / extent layout 原型，替代每层小文件路径用于 32K 级 restore
 - [ ] P1：接入 LMCache 与 DualPath/Tutti/CacheFlow/KVDrive-style baseline 或仿真对比
 - [ ] 生成有效性对比报告，决定是否继续投入真实 3FS executor、packed cold object 和 partial promote
@@ -216,7 +217,7 @@
 - [x] 输出 512/2K/8K/16K/32K × available lead 的 `hide_restore`、`residual_online_wait_ms`、`packed_object_required`
 - [x] 生成 `results/m3_13_prepass_lead_time_plan/` 与研究计划文档
 - [ ] 按 planner 顺序跑 512/2K/8K true PrePass 小矩阵，验证 restore scaling 和 lead-time 模型
-- [ ] 设计 packed cold object / extent layout 原型，在 16K/32K 前验证 per-layer layout tail
+- [x] 设计 packed cold object / extent layout 原型，在 16K/32K 前验证 per-layer layout tail
 - [ ] 在 packed layout 或 8K 稳定后，再跑 16K/32K gate matrix
 - **状态：** in_progress
 
@@ -224,11 +225,14 @@
 - [x] 将数据库 Anti-Cache 的 Evicted Table / Block Table / pre-pass / requeue 思想整理为 KV 多级调度设计
 - [x] 明确 GPU/CPU/SSD 三层语义：HBM 是在线执行层，CPU 是可准入准备层，SSD 是冷区和持久化层
 - [x] 产出设计规格 `docs/specs/m3_14_kv_evicted_index_and_packed_object.md`
-- [x] M3.14-A：实现 `KV Evicted Index` 独立模块，支持 READY/COLD/FETCHING/MISSING/MISMATCH 分类
-- [x] M3.14-B：将 `/prepass` 输出升级为 ready/cold/fetching/missing/mismatch sets，而不只是计数和状态
-- [ ] M3.14-C：实现 `Packed Cold Object v1`，先支持 local_posix packed layout，再接 3fs_posix
-- [ ] M3.14-D：跑 2K/8K packed vs per-layer restore 对比，决定是否进入 16K/32K gate matrix
-- [ ] 在 M3.14-A/B/C 通过后，再回到 M3.13 的 8K/16K/32K gate matrix
+- [x] M3.14-A：实现 `KV Evicted Index` 独立模块，支持基础 residency 分类
+- [x] M3.14-B：将 `/prepass` 输出升级为分类集合，而不只是计数和状态
+- [x] M3.14-B2：修正三级存储语义，将 PrePass/Index 细分为 GPU_READY/CPU_READY/SSD_COLD/FETCHING/LOADING/MISSING/MISMATCH，并保留 ready/cold 兼容汇总
+- [x] M3.14-B3：建立 CPU_READY -> GPU_READY load readiness 观测口径，区分 SSD->CPU restore 与 CPU->GPU connector load 的时间预算
+- [x] M3.14-C：实现 `Packed Cold Object v1`，先支持 local_posix packed layout，再接 3fs_posix
+- [x] M3.14-D：跑 2K/8K packed vs per-layer restore 对比，决定是否进入 16K/32K gate matrix
+- [x] M3.14-E：优化 packed restore 数据面，避免当前 Python bytes 拼接/切片路径抵消文件数收益
+- [ ] 在 packed restore 优化或 8K 结果稳定后，再回到 M3.13 的 16K/32K gate matrix
 - **状态：** in_progress
 
 ### 研究阶段 R2：KV Anti-Caching 方案深化
@@ -296,9 +300,11 @@
 | M3.12-A PrePass 第一版只证明控制面 restore hiding，不等价于真实 vLLM 性能胜出 | deterministic smoke 已证明 `PREPASS -> ready_before_request=true -> online ADMIT`，但下一步必须跑真实 vLLM B5 PrePass-before-reuse 样本，才能把它纳入 TTFT 对比 |
 | M3.13 优先做 lead-time planner，而不是盲跑 16K/32K | M3.12-B 显示 PrePass online TTFT 有优势，但 restore-inclusive 仍高于 B0；先量化提前量和 packed layout 触发点，才能让后续矩阵结果可解释 |
 | 8K 是下一轮真实扩展的关键 gate | planner 估算 8K 需要约 4.29s lead，5s lead 可隐藏 restore 但已触发 packed object 风险；16K/32K 应等 8K 结果和 packed layout 后再跑 |
-| M3.14 将 Anti-Cache 的 Evicted Table 映射为 KV Evicted Index | 我们不需要 100% 提前预测请求是否踩冷 KV，但必须在请求进入 GPU 前通过内存索引快速判断所需 KV 是 HBM/CPU ready、SSD cold、FETCHING、MISSING 还是 correctness mismatch |
+| M3.14 将 Anti-Cache 的 Evicted Table 映射为 KV Evicted Index | 我们不需要 100% 提前预测请求是否踩冷 KV，但必须在请求进入 GPU 前通过内存索引快速判断所需 KV 是 GPU_READY、CPU_READY、SSD_COLD、FETCHING、LOADING、MISSING 还是 correctness mismatch |
 | M3.14 将 Anti-Cache 的 Block Table 映射为 Packed Cold Object | SSD 上的 KV 应以 object/extent 组织，并把 object id、offset、length 常驻内存索引；PrePass 只查索引即可收集恢复任务，不应扫描磁盘目录 |
 | SSD 不是慢主存，而是冷区和持久化层 | SSD 上的 KV 永远不是 ready；只有恢复到 CPU/HBM 并校验后，才允许 vLLM connector 加载 |
+| M3.14-B2 修正 ready/cold 语义为三级状态 | `CPU_READY` 只表示 SSD->CPU restore 已完成，不表示 decode 可直接执行；`GPU_READY` 才是 HBM 执行 ready；`LOADING` 用于表示 CPU->GPU load 进行中 |
+| M3.14-E 修正 packed_v1 数据面后，packed layout 可以继续进入 8K/16K gate | 初始 packed_v1 虽减少文件数但 restore 明显变慢；streaming restore、fast manifest summarize、demote summary 不再重读 packed object 后，r5 2K/8K 小矩阵中 packed restore p95 比 per-layer 低约 58.521ms，冷区数据文件数从 40 降到 10。但这仍是 local POSIX + qwen25 tiny profile，不是 3FS/生产结论 |
 
 ## 遇到的错误
 | 错误 | 尝试次数 | 解决方案 |
