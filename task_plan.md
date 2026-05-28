@@ -243,7 +243,7 @@
 - [x] 生成真实 `packed_v1` cold object：`1610616960` bytes，冷区仅保留 `packed_object.bin` 与 `packed_manifest.json`
 - [x] 重启 vLLM 后运行 8K `--prepass-before-reuse`，验证 `SSD_COLD -> packed restore -> ADMIT -> external load`
 - [x] 输出研究报告 `docs/research/m3_15_8k_packed_prepass_gate.md`
-- [ ] 补同配置 8K B0/B2 baseline：同样使用 `--max-model-len 16384 --max-num-batched-tokens 16384`
+- [x] 补同配置 8K B0/B2 baseline：同样使用 `--max-model-len 16384 --max-num-batched-tokens 16384`
 - [ ] 跑 512/2K/8K compact packed PrePass matrix，复核 restore scaling 和 token-mismatch guard
 - [ ] 优化 packed restore/load 数据面，降低 8K restore executor 与 connector load 时间
 - [ ] 在 8K baseline 与数据面归因完成后，再进入 16K gate
@@ -321,6 +321,7 @@
 | M3.14-E 修正 packed_v1 数据面后，packed layout 可以继续进入 8K/16K gate | 初始 packed_v1 虽减少文件数但 restore 明显变慢；streaming restore、fast manifest summarize、demote summary 不再重读 packed object 后，r5 2K/8K 小矩阵中 packed restore p95 比 per-layer 低约 58.521ms，冷区数据文件数从 40 降到 10。但这仍是 local POSIX + qwen25 tiny profile，不是 3FS/生产结论 |
 | 8K packed PrePass gate 必须校验实际保存 token 数 | 首次 8K 尝试因 vLLM chunked prefill/scheduler token budget 只保存 2048 tokens；后续长上下文 store 必须要求 `cold_saved_tokens == requested_prefix_tokens`，否则样本无效 |
 | M3.15 8K packed PrePass 链路成立但还不是性能终局 | 当前 8K 样本 online TTFT 为 710.835ms、restore executor 为 3046.794ms、restore-inclusive 为 3797.230ms；说明 PrePass 可以隐藏 restore，但若提前量不足仍不满足严格 SLA |
+| 同配置 8K B0/B2 baseline 已补齐 | B0 full prefill 为 2409.141ms，严格 B2 restart 为 2418.796ms，B2/B0 为 1.004008；8K packed PrePass online 为 B0 的 0.295057x，但 restore-inclusive 为 B0 的 1.576176x |
 
 ## 遇到的错误
 | 错误 | 尝试次数 | 解决方案 |
@@ -359,6 +360,7 @@
 | B5 首次 2K store 阶段未带 `--cold-tier-restore`，导致没有真实 demote 到 cold tier | 1 | 保留原目录作为不完整样本，另起 `b5_anti_caching_true` 干净重跑 store+demote+mark-cold+restart+restore |
 | 本机缺少 `column` 命令 | 1 | 改用 `sed` 查看 CSV 原始内容；后续脚本和报告不依赖 `column` |
 | 8K store 首次只保存 2048 tokens 而不是 8192 tokens | 1 | 增加 `cold_saved_token_mismatch` guard，并用 `--max-num-batched-tokens 16384` 重跑有效 8K 样本 |
+| B2 strict restart 首次传递 `--vllm-extra-arg --max-num-batched-tokens` 被 argparse 误解析 | 1 | 改用 `--vllm-extra-arg=--max-num-batched-tokens --vllm-extra-arg=16384` |
 
 ## 备注
 - `task_plan.md` 记录阶段和决策。

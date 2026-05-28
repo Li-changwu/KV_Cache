@@ -470,6 +470,11 @@
 - 需要谨慎解释：该样本证明 8K packed Anti-Caching 语义链路成立，但性能尚未达终局。若 restore 已被提前窗口隐藏，online TTFT 为 `710.835ms`；若从 PrePass 开始计入，restore-inclusive 为 `25.280 + 3061.115 + 710.835 = 3797.230ms`，主要由 packed restore executor 支配。
 - 与 M3.13 planner 相比，实际 8K restore executor `3046.794ms` 低于先前保守 required lead 估计 `4291.113ms`，说明 5s lead 在本机样本上有机会隐藏 restore。但进入 16K/32K 前必须补同配置 8K B0/B2 baseline，并继续优化 restore/load 数据面。
 - 下一步优先级应调整为：同配置 8K B0/B2 baseline、512/2K/8K compact packed PrePass matrix、packed restore/load 归因优化。直接冲 32K 信息增益不高，容易把 baseline 差异、restore executor、connector load 和 chunked prefill 问题混在一起。
+- 已补齐同配置 8K B0/B2 baseline，结果目录为 `results/m3_15_8k_baseline_same_config/`。配置为 `--max-model-len 16384 --max-num-batched-tokens 16384 --enforce-eager --enable-prefix-caching`，shape 同为 8192 prefix + 128 suffix + 1 output。
+- 8K B0 full prefill TTFT 为 `2409.141ms`；严格 B2 restart TTFT 为 `2418.796ms`，B2/B0 为 `1.004008`。这说明同配置下 vLLM 内置 APC 在进程重启后没有保留 8K 历史 KV，B2 可作为 cold-cache 边界。
+- 与同配置 B0 相比，B5 packed PrePass online TTFT `710.835ms` 是 B0 的 `0.295057x`，说明如果 PrePass/restore 能被工作流提前隐藏，8K online 请求已有明显收益。
+- 但 B5 packed PrePass restore-inclusive 为 `3797.230ms`，是 B0 的 `1.576176x`；瓶颈仍是 `3046.794ms` packed restore executor 和 `469.372ms` connector load。因此当前贡献应表述为“PrePass lead-time 下的 online TTFT 改善”，而不是“请求到达后同步恢复也满足 SLA”。
+- 产物包括 `results/m3_15_8k_baseline_same_config/b0_b2_b5_8k_comparison.md`、`b0_b2_b5_8k_comparison.csv` 和 `b0_b2_b5_8k_summary.json`。M3.15 研究报告已更新同配置 baseline 口径。
 
 ## 视觉/浏览器发现
 - 本轮尚未使用视觉或浏览器资料。

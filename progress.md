@@ -1681,3 +1681,33 @@
   - `pytest tests/m3/test_reuse_smoke_matrix.py tests/m3/test_packed_cold_object.py -q`：`24 passed in 3.11s`。
   - `python -m py_compile benchmarks/m3/run_reuse_smoke_matrix.py benchmarks/m3/cold_tier.py`：通过。
   - `git diff --check`：通过。
+
+### 阶段 M3.15-B：同配置 8K B0/B2 baseline
+- **状态：** complete
+- 时间：2026-05-28T05:43:00Z
+- 执行的操作：
+  - 按 M3.15 规划补同配置 8K baseline，确保与 packed PrePass 样本使用相同 `--max-model-len 16384 --max-num-batched-tokens 16384 --enforce-eager --enable-prefix-caching`。
+  - 手动启动原生 vLLM，运行 B0 full-prefill 8K baseline，结果目录 `results/m3_15_8k_baseline_same_config/b0/`。
+  - 停止 B0 服务后，使用 `run_baseline_readiness_matrix.py --strict-b2-restart` 运行严格 B2 restart baseline，结果目录 `results/m3_15_8k_baseline_same_config/b2_strict/`。
+  - 第一次 B2 命令因 `--vllm-extra-arg --max-num-batched-tokens` 被 argparse 解析为缺少参数而退出，未启动 vLLM；随后改用 `--vllm-extra-arg=--max-num-batched-tokens --vllm-extra-arg=16384` 重跑。
+  - 生成对比产物：`results/m3_15_8k_baseline_same_config/b0_b2_b5_8k_comparison.md`、`b0_b2_b5_8k_comparison.csv`、`b0_b2_b5_8k_summary.json`。
+  - 更新 `docs/research/m3_15_8k_packed_prepass_gate.md`，将解释口径从旧 2K B0 参照改为同配置 8K B0/B2 参照。
+- 关键结果：
+  - B0 full prefill TTFT：`2409.141ms`。
+  - B2 strict restart TTFT：`2418.796ms`，B2/B0 为 `1.004008`。
+  - B5 packed PrePass online TTFT：`710.835ms`，online/B0 为 `0.295057`，online/B2 为 `0.293880`。
+  - B5 packed PrePass restore-inclusive：`3797.230ms`，restore-inclusive/B0 为 `1.576176`，restore-inclusive/B2 为 `1.569884`。
+  - 结论：8K PrePass online 路径相对 full-prefill 已有明显收益，但如果 restore 不能被提前隐藏，端到端仍高于 B0，当前瓶颈仍是 restore executor 和 connector load。
+- 修改文件：
+  - `docs/research/m3_15_8k_packed_prepass_gate.md`
+  - `task_plan.md`
+  - `findings.md`
+  - `progress.md`
+- 下一步：
+  - 跑 512/2K/8K compact packed PrePass matrix，复核 scaling 和 token-mismatch guard。
+  - 优化 packed restore/load 数据面后再进入 16K gate。
+- 验证：
+  - `pytest tests/m3/test_baseline_readiness_matrix.py tests/m3/test_reuse_smoke_matrix.py tests/m3/test_packed_cold_object.py -q`：`39 passed in 4.75s`。
+  - `python -m py_compile benchmarks/m3/run_baseline_readiness_matrix.py benchmarks/m3/run_reuse_smoke_matrix.py benchmarks/m3/cold_tier.py`：通过。
+  - `git diff --check`：通过。
+  - 清理检查：8000/8010 端口均无服务，未发现 `vllm serve`、`EngineCore`、`http_sidecar_cli` 残留进程。
