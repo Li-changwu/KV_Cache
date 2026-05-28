@@ -146,24 +146,19 @@ H2O, Scissorhands, CacheGen, TTKV, KVDrive &
 
 \vspace{0.35em}
 
-\begin{block}{Challenge 1：如何在 admission 前知道本轮需要哪些 KV？}
-LLM 请求的历史状态来自 session lineage、共享文档、system prompt、tool trace 和新 suffix。
-如果只在 prefill 或 decode 执行时才发现缺 KV，要么触发历史重算，要么把冷层 I/O 放进关键路径。
-
-\vspace{0.25em}
-\textbf{\textcolor{AccentRed}{挑战本质：}}
-把 ``未来会访问的历史 KV'' 在请求进入执行前静态化为 required ranges。
+\begin{block}{Challenge 1：如何在多级存储中持续追踪历史 KV 的状态？}
+长上下文 KV 可能在 GPU HBM、CPU DRAM、SSD 或 3FS 之间迁移，离开 GPU 后就不再是引擎内部直接可见的 hot cache。系统必须持续记录每段 KV 的 token 范围、层范围、correctness key、存储位置和 ready 状态，否则无法判断它是否仍然存在、是否可用以及能否被恢复。
 \end{block}
 
 \vspace{0.35em}
 
-\begin{block}{Challenge 2：如何保证复用的 KV 绝对正确？}
-KV 正确性不仅取决于 token ids，还取决于模型权重、tokenizer、RoPE/YaRN、dtype、
-KV layout、attention backend、block size、LoRA 和版本。
+\begin{block}{Challenge 2：如何在请求进入 LLM 引擎之前判断其所需 KV 的冷热状态？}
+一个多轮请求可能依赖大量历史 KV 范围，其中一部分已经在 GPU/CPU 中 ready，一部分可能只在 SSD/3FS 中 cold，还有一部分可能正在恢复、缺失或与当前请求不匹配。系统必须在执行前枚举这些所需历史 KV，并将它们分类为 GPU-ready、CPU-ready、SSD-cold、fetching、loading、missing 或 mismatch，从而生成明确的 reuse plan 和 restore plan。
 
-\vspace{0.25em}
-\textbf{\textcolor{AccentRed}{挑战本质：}}
-在多轮、多租户、多模型环境中，错误复用比 miss 更危险，必须用 strict correctness key 和版本化 manifest 防住。
+\vspace{0.35em}
+
+\begin{block}{Challenge 3：如何避免冷 KV 恢复阻塞在线执行路径？}
+即使系统知道某段历史 KV 在 SSD 上，也不能让请求进入 prefill 或 decode 后再同步等待 SSD 读取，否则冷数据访问会直接放大 TTFT、TPOT 和尾延迟。系统必须在请求进入 LLM 引擎之前，基于所需 KV 的状态做出准入决策：如果存在 cold KV，则提前发起异步恢复，并在恢复完成前拒绝或延迟请求；如果恢复不完又不能准入，则必须有 fallback 策略（如部分预填充、部分重算、降级或拒绝），以避免冷 I/O 失控。
 \end{block}
 
 \end{frame}
