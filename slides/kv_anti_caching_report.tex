@@ -156,7 +156,12 @@ H2O, Scissorhands, CacheGen, TTKV, KVDrive &
 一个多轮请求可能依赖大量历史 KV 范围，其中一部分已经在 GPU/CPU 中 ready，一部分可能只在 SSD/3FS 中 cold，还有一部分可能正在恢复、缺失或与当前请求不匹配。系统必须在执行前枚举这些所需历史 KV，并将它们分类为 GPU-ready、CPU-ready、SSD-cold、fetching、loading、missing 或 mismatch，从而生成明确的 reuse plan 和 restore plan。
 \end{block}
 
-\vspace{0.35em}
+
+\end{frame}
+
+\begin{frame}[t]{What is your key idea? }
+\small
+\vspace{-0.35em}
 
 \begin{block}{Challenge 3：如何避免冷 KV 恢复阻塞在线执行路径？}
 即使系统知道某段历史 KV 在 SSD 上，也不能让请求进入 prefill 或 decode 后再同步等待 SSD 读取，否则冷数据访问会直接放大 TTFT、TPOT 和尾延迟。系统必须在请求进入 LLM 引擎之前，基于所需 KV 的状态做出准入决策：如果存在 cold KV，则提前发起异步恢复，并在恢复完成前拒绝或延迟请求；如果恢复不完又不能准入，则必须有 fallback 策略（如部分预填充、部分重算、降级或拒绝），以避免冷 I/O 失控。
@@ -164,96 +169,152 @@ H2O, Scissorhands, CacheGen, TTKV, KVDrive &
 
 \end{frame}
 
-\begin{frame}[t]{What is your key idea? 需要解决哪些挑战？}
-\small
-\vspace{-0.35em}
+\begin{frame}[t]{What is your design? (1/3) KVPrePass + Residency Table}
+\scriptsize
+\vspace{-0.7em}
 
-\begin{block}{Challenge 3：如何组织 cold object，避免恢复读放大？}
-如果一个 1M session 的冷对象很大，而本轮只需要其中一小段，整对象恢复会浪费带宽并污染 DRAM。
-如果对象太碎，又会带来海量小文件、随机 I/O 和元数据开销。
-
-\vspace{0.25em}
-\textbf{\textcolor{AccentRed}{挑战本质：}}
-在 KV range 粒度和 3FS/NVMe 友好对象粒度之间建立可 partial promote 的布局。
+\begin{block}{Challenge 1：Prefill/Decode 前不知道 required KV}
+冷层 miss 若在 prefill reuse 或 decode execution 才被发现，SSD/3FS 访问就会进入 TTFT 或 TPOT 关键路径。核心要求是在请求进入 vLLM 前，精确知道哪些历史 KV 可复用、在哪一层存储、是否已经 ready。
 \end{block}
 
-\vspace{0.35em}
+\vspace{0.05em}
 
-\begin{block}{Challenge 4：如何在多资源约束下准入请求？}
-restore 不是单一磁盘读，还会消耗 3FS/SSD、network/RDMA、DRAM、H2D、GPU slack，
-并可能影响短请求 P99。低局部性长请求如果盲目进入队列，会拖垮整个服务。
-
-\vspace{0.25em}
-\textbf{\textcolor{AccentRed}{挑战本质：}}
-把 TTFT、hit rate、带宽水位、deadline miss 和短请求隔离统一进 admission decision。
+\begin{columns}[T,onlytextwidth]
+\begin{column}{0.49\textwidth}
+\begin{block}{1. Range-based KV Record}
+以 KV range 作为最小可管理对象，而不是把 KV 仅看作 GPU 内 block。
+\begin{itemize}
+\setlength{\itemsep}{0em}
+\item \textbf{身份：}\texttt{session\_id}、turn、token range、layer range。
+\item \textbf{正确性：}model、tokenizer、RoPE/position、dtype、layout、checksum。
+\item \textbf{位置：}HBM、DRAM、SSD、3FS，以及 byte offset。
+\end{itemize}
 \end{block}
+\end{column}
+
+\begin{column}{0.49\textwidth}
+\begin{block}{2. Residency Table}
+控制面维护每段 KV 的运行时状态，使引擎外的冷 KV 仍然可见。
+\begin{itemize}
+\setlength{\itemsep}{0em}
+\item \texttt{GPU\_READY / CPU\_READY / COLD}。
+\item \texttt{RESTORING / MISSING / MISMATCH}。
+\item 记录 size、last access、refcount、restore cost。
+\end{itemize}
+\end{block}
+\end{column}
+\end{columns}
+
+\vspace{0.05em}
+
+\begin{block}{3. Commit and Demotion Protocol}
+请求成功后，connector 提交 KV manifest 与 checksum；只有 cold object 持久化并完成 manifest commit 后，系统才释放 HBM/DRAM 副本。每次 demotion、restore、失效都先更新 Residency Table，再向 vLLM 暴露可复用状态。
+\end{block}
+
+\vspace{0.02em}
+\begin{beamercolorbox}[wd=\linewidth,sep=0.35em,rounded=true]{block body}
+\textbf{\textcolor{AccentRed}{输出：}}
+对任意 required range，系统都能返回 \texttt{ready / cold / restoring / missing / mismatch} 与精确位置，避免执行时才发现 blind miss。
+\end{beamercolorbox}
 
 \end{frame}
 
-\begin{frame}[t]{What is your key idea? 三个挑战对应三个设计}
-\fontsize{6.8pt}{7.4pt}\selectfont
-\vspace{-0.8em}
+\begin{frame}[t]{What is your design? (2/3) Cold Object + Partial Promote}
+\scriptsize
+\vspace{-0.7em}
 
-\begin{columns}[T,onlytextwidth]
-\begin{column}{0.49\textwidth}
-\begin{block}{Challenge 1：Prefill/Decode 前不知道 required KV}
-冷层 miss 若在 prefill reuse 或 decode execution 才被发现，SLA 已不可控。
-\end{block}
-\end{column}
-\begin{column}{0.49\textwidth}
-\begin{block}{Design 1：KVPrePass + Residency Table}
-请求进入 vLLM 前，基于 correctness key 和 session lineage 枚举
-\texttt{ready\_set / cold\_set / missing\_set}。
-
-\vspace{0.1em}
-\textbf{\textcolor{AccentRed}{输出：}}本轮 required KV ranges。
-\end{block}
-\end{column}
-\end{columns}
-
-\vspace{0.05em}
-
-\begin{columns}[T,onlytextwidth]
-\begin{column}{0.49\textwidth}
 \begin{block}{Challenge 2：冷对象恢复容易读放大}
-整块恢复浪费带宽；过细切分又导致元数据和 I/O 抖动。
+若按整段 session 恢复，1M 历史中未被本轮使用的 KV 会浪费 SSD/3FS 带宽和 DRAM；若按过细粒度保存，又会产生大量小文件、随机 I/O 和元数据开销。
+\end{block}
+
+\vspace{0.05em}
+
+\begin{columns}[T,onlytextwidth]
+\begin{column}{0.50\textwidth}
+\begin{block}{1. Cold Object Layout}
+系统把细粒度 KV ranges 打包成存储友好的 cold object。
+\begin{itemize}
+\setlength{\itemsep}{0em}
+\item 对连续 token range 和 layer range 做分组。
+\item object manifest 记录 range 到 byte offset 的映射。
+\item 写入前附带 checksum、layout version 和 correctness key。
+\end{itemize}
 \end{block}
 \end{column}
-\begin{column}{0.49\textwidth}
-\begin{block}{Design 2：Cold Object + Partial Promote}
-把细粒度 KV ranges 打包成 3FS/NVMe 友好 cold object，
-只把本轮需要的 ranges promote 到 DRAM ready。
 
-\vspace{0.1em}
-\textbf{\textcolor{AccentRed}{输出：}}useful bytes 可观测的恢复计划。
+\begin{column}{0.48\textwidth}
+\begin{block}{2. Partial Promote}
+恢复时不把整个 object 拉回执行层，而只 promote 本轮需要的 slices。
+\begin{itemize}
+\setlength{\itemsep}{0em}
+\item 合并相邻 slices，减少随机读。
+\item 复用 in-flight restore，避免重复拉取。
+\item 目标层可为 DRAM ready 或 HBM ready。
+\end{itemize}
 \end{block}
 \end{column}
 \end{columns}
 
 \vspace{0.05em}
 
-\begin{columns}[T,onlytextwidth]
-\begin{column}{0.49\textwidth}
-\begin{block}{Challenge 3：恢复与重算会竞争多种资源}
-3FS、network、H2D、DRAM 和 GPU slack 都可能成为尾延迟来源。
+\begin{block}{3. Restore Plan}
+KVPrePass 将 \texttt{cold\_set} 转换为 \texttt{restore\_plan}：每个任务包含 object id、offset、length、target tier、deadline 和预计 useful bytes。若 useful bytes 占比过低，调度器可以转向 partial recompute、delay 或 reject。
 \end{block}
-\end{column}
-\begin{column}{0.49\textwidth}
-\begin{block}{Design 3：Budgeted Scheduler + Two-Phase Barrier}
-用多资源预算和 deadline 控制 restore / recompute fallback；
-只有 required ranges 对 prefill reuse 与 decode 都 ready，admission 才能返回 ADMIT。
 
 \vspace{0.02em}
-\textbf{\textcolor{AccentRed}{输出：}}无重算失控、无同步 cold miss 的准入决策。
+\begin{beamercolorbox}[wd=\linewidth,sep=0.35em,rounded=true]{block body}
+\textbf{\textcolor{AccentRed}{输出：}}
+冷层恢复从 ``搬回一个缓存对象'' 变为 ``按本轮需求提升精确 KV ranges''，用可观测的 read amplification 控制恢复代价。
+\end{beamercolorbox}
+
+\end{frame}
+
+\begin{frame}[t]{What is your design? (3/3) Budgeted Scheduler + Two-Phase Barrier}
+\scriptsize
+\vspace{-0.7em}
+
+\begin{block}{Challenge 3：恢复与重算会竞争多种资源}
+restore 不是单一磁盘读。SSD/3FS、network、DRAM、H2D、GPU slack 都会影响 TTFT 和短请求 P99；若缺少准入控制，低局部性长请求会把 cold I/O 暴露给在线执行路径。
+\end{block}
+
+\vspace{0.05em}
+
+\begin{columns}[T,onlytextwidth]
+\begin{column}{0.50\textwidth}
+\begin{block}{1. Budgeted Restore Scheduler}
+调度器把 restore 看作多资源任务，而不是后台 best-effort copy。
+\begin{itemize}
+\setlength{\itemsep}{0em}
+\item 估计 SSD/3FS read、network、DRAM、H2D 和 GPU slack。
+\item 按 deadline、useful bytes、复用概率和短请求隔离排序。
+\item 对低收益 restore 做 throttling 或转为 recompute fallback。
+\end{itemize}
+\end{block}
+\end{column}
+
+\begin{column}{0.48\textwidth}
+\begin{block}{2. Admission Decision}
+请求进入 vLLM 前必须得到明确准入结果。
+\begin{itemize}
+\setlength{\itemsep}{0em}
+\item \texttt{ADMIT}：required ranges 已 ready。
+\item \texttt{WAIT}：可在 TTFT budget 内恢复完成。
+\item \texttt{FALLBACK/REJECT}：missing、mismatch 或恢复预算不足。
+\end{itemize}
 \end{block}
 \end{column}
 \end{columns}
 
-\vspace{0.1em}
+\vspace{0.05em}
+
+\begin{block}{3. Two-Phase Ready Barrier}
+第一阶段保证 prefill reuse 所需历史 KV 已 ready；第二阶段保证 decode 将访问的 KV 不会触发同步 cold miss。若任一 range restore 失败或版本变化，请求回到 KVPrePass 重新规划，而不是带着不确定状态进入执行。
+\end{block}
+
+\vspace{0.02em}
 \begin{beamercolorbox}[wd=\linewidth,sep=0.35em,rounded=true]{block body}
-\textbf{\textcolor{AccentRed}{一句话贡献：}}
-通过\textbf{KVPrePass + partial promotion + budgeted non-blocking restore}，
-把 1M 历史 KV 从 ``机会式缓存命中或失败重算'' 变成 ``SLA 受控的服务协议''。
+\textbf{\textcolor{AccentRed}{输出：}}
+admission 后的 vLLM 只消费 ready KV，系统目标是 \texttt{sync\_cold\_miss\_total=0}，把 cold I/O 从执行关键路径移到可调度的控制面。
 \end{beamercolorbox}
 
 \end{frame}
