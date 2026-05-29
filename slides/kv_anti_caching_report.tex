@@ -169,155 +169,192 @@ H2O, Scissorhands, CacheGen, TTKV, KVDrive &
 
 \end{frame}
 
-\begin{frame}[t]{What is your design? (1/3) KVPrePass + Residency Table}
-\scriptsize
-\vspace{-0.7em}
-
-\begin{block}{Challenge 1：Prefill/Decode 前不知道 required KV}
-冷层 miss 若在 prefill reuse 或 decode execution 才被发现，SSD/3FS 访问就会进入 TTFT 或 TPOT 关键路径。核心要求是在请求进入 vLLM 前，精确知道哪些历史 KV 可复用、在哪一层存储、是否已经 ready。
-\end{block}
-
-\vspace{0.05em}
-
-\begin{columns}[T,onlytextwidth]
-\begin{column}{0.49\textwidth}
-\begin{block}{1. Range-based KV Record}
-以 KV range 作为最小可管理对象，而不是把 KV 仅看作 GPU 内 block。
-\begin{itemize}
-\setlength{\itemsep}{0em}
-\item \textbf{身份：}\texttt{session\_id}、turn、token range、layer range。
-\item \textbf{正确性：}model、tokenizer、RoPE/position、dtype、layout、checksum。
-\item \textbf{位置：}HBM、DRAM、SSD、3FS，以及 byte offset。
-\end{itemize}
-\end{block}
-\end{column}
-
-\begin{column}{0.49\textwidth}
-\begin{block}{2. Residency Table}
-控制面维护每段 KV 的运行时状态，使引擎外的冷 KV 仍然可见。
-\begin{itemize}
-\setlength{\itemsep}{0em}
-\item \texttt{GPU\_READY / CPU\_READY / COLD}。
-\item \texttt{RESTORING / MISSING / MISMATCH}。
-\item 记录 size、last access、refcount、restore cost。
-\end{itemize}
-\end{block}
-\end{column}
-\end{columns}
-
-\vspace{0.05em}
-
-\begin{block}{3. Commit and Demotion Protocol}
-请求成功后，connector 提交 KV manifest 与 checksum；只有 cold object 持久化并完成 manifest commit 后，系统才释放 HBM/DRAM 副本。每次 demotion、restore、失效都先更新 Residency Table，再向 vLLM 暴露可复用状态。
-\end{block}
-
-\vspace{0.02em}
-\begin{beamercolorbox}[wd=\linewidth,sep=0.35em,rounded=true]{block body}
-\textbf{\textcolor{AccentRed}{输出：}}
-对任意 required range，系统都能返回 \texttt{ready / cold / restoring / missing / mismatch} 与精确位置，避免执行时才发现 blind miss。
-\end{beamercolorbox}
-
+\begin{frame}[plain]
+\begin{tikzpicture}[remember picture,overlay]
+\node at (current page.center) {
+  \includegraphics[
+    width=1.02\paperwidth,
+    height=1.02\paperheight,
+    keepaspectratio
+  ]{Challenge1.png}
+};
+\end{tikzpicture}
 \end{frame}
 
-\begin{frame}[t]{What is your design? (2/3) Cold Object + Partial Promote}
-\scriptsize
-\vspace{-0.7em}
-
-\begin{block}{Challenge 2：冷对象恢复容易读放大}
-若按整段 session 恢复，1M 历史中未被本轮使用的 KV 会浪费 SSD/3FS 带宽和 DRAM；若按过细粒度保存，又会产生大量小文件、随机 I/O 和元数据开销。
-\end{block}
-
-\vspace{0.05em}
-
-\begin{columns}[T,onlytextwidth]
-\begin{column}{0.50\textwidth}
-\begin{block}{1. Cold Object Layout}
-系统把细粒度 KV ranges 打包成存储友好的 cold object。
-\begin{itemize}
-\setlength{\itemsep}{0em}
-\item 对连续 token range 和 layer range 做分组。
-\item object manifest 记录 range 到 byte offset 的映射。
-\item 写入前附带 checksum、layout version 和 correctness key。
-\end{itemize}
-\end{block}
-\end{column}
-
-\begin{column}{0.48\textwidth}
-\begin{block}{2. Partial Promote}
-恢复时不把整个 object 拉回执行层，而只 promote 本轮需要的 slices。
-\begin{itemize}
-\setlength{\itemsep}{0em}
-\item 合并相邻 slices，减少随机读。
-\item 复用 in-flight restore，避免重复拉取。
-\item 目标层可为 DRAM ready 或 HBM ready。
-\end{itemize}
-\end{block}
-\end{column}
-\end{columns}
-
-\vspace{0.05em}
-
-\begin{block}{3. Restore Plan}
-KVPrePass 将 \texttt{cold\_set} 转换为 \texttt{restore\_plan}：每个任务包含 object id、offset、length、target tier、deadline 和预计 useful bytes。若 useful bytes 占比过低，调度器可以转向 partial recompute、delay 或 reject。
-\end{block}
-
-\vspace{0.02em}
-\begin{beamercolorbox}[wd=\linewidth,sep=0.35em,rounded=true]{block body}
-\textbf{\textcolor{AccentRed}{输出：}}
-冷层恢复从 ``搬回一个缓存对象'' 变为 ``按本轮需求提升精确 KV ranges''，用可观测的 read amplification 控制恢复代价。
-\end{beamercolorbox}
-
+\begin{frame}[plain]
+\begin{tikzpicture}[remember picture,overlay]
+\node at (current page.center) {
+  \includegraphics[
+    width=1.02\paperwidth,
+    height=1.02\paperheight,
+    keepaspectratio
+  ]{Challenge2.png}
+};
+\end{tikzpicture}
 \end{frame}
 
-\begin{frame}[t]{What is your design? (3/3) Budgeted Scheduler + Two-Phase Barrier}
-\scriptsize
-\vspace{-0.7em}
-
-\begin{block}{Challenge 3：恢复与重算会竞争多种资源}
-restore 不是单一磁盘读。SSD/3FS、network、DRAM、H2D、GPU slack 都会影响 TTFT 和短请求 P99；若缺少准入控制，低局部性长请求会把 cold I/O 暴露给在线执行路径。
-\end{block}
-
-\vspace{0.05em}
-
-\begin{columns}[T,onlytextwidth]
-\begin{column}{0.50\textwidth}
-\begin{block}{1. Budgeted Restore Scheduler}
-调度器把 restore 看作多资源任务，而不是后台 best-effort copy。
-\begin{itemize}
-\setlength{\itemsep}{0em}
-\item 估计 SSD/3FS read、network、DRAM、H2D 和 GPU slack。
-\item 按 deadline、useful bytes、复用概率和短请求隔离排序。
-\item 对低收益 restore 做 throttling 或转为 recompute fallback。
-\end{itemize}
-\end{block}
-\end{column}
-
-\begin{column}{0.48\textwidth}
-\begin{block}{2. Admission Decision}
-请求进入 vLLM 前必须得到明确准入结果。
-\begin{itemize}
-\setlength{\itemsep}{0em}
-\item \texttt{ADMIT}：required ranges 已 ready。
-\item \texttt{WAIT}：可在 TTFT budget 内恢复完成。
-\item \texttt{FALLBACK/REJECT}：missing、mismatch 或恢复预算不足。
-\end{itemize}
-\end{block}
-\end{column}
-\end{columns}
-
-\vspace{0.05em}
-
-\begin{block}{3. Two-Phase Ready Barrier}
-第一阶段保证 prefill reuse 所需历史 KV 已 ready；第二阶段保证 decode 将访问的 KV 不会触发同步 cold miss。若任一 range restore 失败或版本变化，请求回到 KVPrePass 重新规划，而不是带着不确定状态进入执行。
-\end{block}
-
-\vspace{0.02em}
-\begin{beamercolorbox}[wd=\linewidth,sep=0.35em,rounded=true]{block body}
-\textbf{\textcolor{AccentRed}{输出：}}
-admission 后的 vLLM 只消费 ready KV，系统目标是 \texttt{sync\_cold\_miss\_total=0}，把 cold I/O 从执行关键路径移到可调度的控制面。
-\end{beamercolorbox}
-
+\begin{frame}[plain]
+\begin{tikzpicture}[remember picture,overlay]
+\node at (current page.center) {
+  \includegraphics[
+    width=1.02\paperwidth,
+    height=1.02\paperheight,
+    keepaspectratio
+  ]{Challenge3.png}
+};
+\end{tikzpicture}
 \end{frame}
+
+
+% \begin{frame}[t]{我们的设计是什么？(1/3) 持续追踪历史 KV 状态}
+% \scriptsize
+% \vspace{-0.7em}
+
+% \begin{block}{Challenge 1：如何在多级存储中持续追踪历史 KV 的状态？}
+% 历史 KV 会在 HBM、DRAM、SSD/3FS 之间迁移。设计目标是把 KV 从引擎内部的临时缓存，提升为控制面可查询、可校验、可恢复的服务状态。
+% \end{block}
+
+% \vspace{0.05em}
+
+% \begin{columns}[T,onlytextwidth]
+% \begin{column}{0.49\textwidth}
+% \begin{block}{1. KV 范围清单}
+% 以 token 范围和层范围作为最小状态单元，为每段 KV 建立持久化描述。
+% \begin{itemize}
+% \setlength{\itemsep}{0em}
+% \item \textbf{身份：}\texttt{session\_id}、轮次、token/层范围。
+% \item \textbf{正确性：}模型、分词器、位置编码、数据类型、布局、校验和。
+% \item \textbf{位置：}存储层级、对象编号、字节偏移、大小。
+% \end{itemize}
+% \end{block}
+% \end{column}
+
+% \begin{column}{0.49\textwidth}
+% \begin{block}{2. 驻留状态机}
+% 驻留表记录每段 KV 的实时状态，并约束状态迁移。
+% \begin{itemize}
+% \setlength{\itemsep}{0em}
+% \item \texttt{GPU\_就绪 / CPU\_就绪 / 冷层}。
+% \item \texttt{恢复中 / 加载中 / 缺失 / 不匹配}。
+% \item 维护版本、引用计数、最近访问时间和恢复代价。
+% \end{itemize}
+% \end{block}
+% \end{column}
+% \end{columns}
+
+% \vspace{0.05em}
+
+% \begin{block}{3. 原子提交与降温}
+% 请求成功后，连接器先提交 KV 清单、校验和与冷层对象；只有清单提交成功后，系统才释放 HBM/DRAM 副本。降温、恢复、失效都必须先更新驻留表，再向 vLLM 暴露可复用状态。
+% \end{block}
+
+% \vspace{0.02em}
+% \begin{beamercolorbox}[wd=\linewidth,sep=0.35em,rounded=true]{block body}
+% \textbf{\textcolor{AccentRed}{输出：}}
+% 对任意历史 KV 范围，控制面都能返回“状态、位置、版本、恢复代价”，为后续预检查与准入控制提供唯一事实来源。
+% \end{beamercolorbox}
+
+% \end{frame}
+
+% \begin{frame}[t]{我们的设计是什么？(2/3) 执行前判断所需 KV 冷热}
+% \scriptsize
+% \vspace{-0.7em}
+
+% \begin{block}{Challenge 2：如何在请求进入 LLM 引擎之前判断其所需 KV 的冷热状态？}
+% 一个请求可能只复用长历史中的若干范围。设计目标是在进入 vLLM 前完成所需 KV 枚举、正确性校验和冷热分类，生成明确的复用计划与恢复计划。
+% \end{block}
+
+% \vspace{0.05em}
+
+% \begin{columns}[T,onlytextwidth]
+% \begin{column}{0.50\textwidth}
+% \begin{block}{1. KV 预检查：发现所需范围}
+% 网关/旁路控制面在请求准入前执行轻量预检查。
+% \begin{itemize}
+% \setlength{\itemsep}{0em}
+% \item 根据会话脉络和提示前缀定位可复用历史。
+% \item 生成本轮所需 token/层范围。
+% \item 对齐 vLLM 块/页粒度，避免运行时再拆分。
+% \end{itemize}
+% \end{block}
+% \end{column}
+
+% \begin{column}{0.48\textwidth}
+% \begin{block}{2. 正确性与驻留状态探测}
+% 预检查查询清单和驻留表，逐段判定能否复用。
+% \begin{itemize}
+% \setlength{\itemsep}{0em}
+% \item 校验模型、分词器、位置编码、数据类型和校验和。
+% \item 分类为 \texttt{GPU\_就绪 / CPU\_就绪 / 冷层}。
+% \item 标记为 \texttt{恢复中 / 缺失 / 不匹配}。
+% \end{itemize}
+% \end{block}
+% \end{column}
+% \end{columns}
+
+% \vspace{0.05em}
+
+% \begin{block}{3. 复用计划与恢复计划}
+% 预检查输出两类计划：复用计划描述哪些范围可直接挂接到预填充/解码；恢复计划描述冷层范围的对象编号、偏移、长度、目标层级、截止时间和预计代价。缺失或不匹配的范围直接进入重算或拒绝分支。
+% \end{block}
+
+% \vspace{0.02em}
+% \begin{beamercolorbox}[wd=\linewidth,sep=0.35em,rounded=true]{block body}
+% \textbf{\textcolor{AccentRed}{输出：}}
+% 请求进入 LLM 引擎之前，系统已经得到“就绪集合、冷层集合、恢复中集合、降级集合”，避免执行阶段才发现不可复用 KV。
+% \end{beamercolorbox}
+
+% \end{frame}
+
+% \begin{frame}[t]{我们的设计是什么？(3/3) 避免冷 KV 阻塞执行路径}
+% \scriptsize
+% \vspace{-0.7em}
+
+% \begin{block}{Challenge 3：如何避免冷 KV 恢复阻塞在线执行路径？}
+% 冷 KV 不能在预填充或解码中同步读取。设计目标是把 SSD/3FS 读写从执行关键路径移到控制面，用预算化恢复、准入控制和就绪屏障保证 vLLM 只消费就绪 KV。
+% \end{block}
+
+% \vspace{0.05em}
+
+% \begin{columns}[T,onlytextwidth]
+% \begin{column}{0.50\textwidth}
+% \begin{block}{1. 预算化恢复调度}
+% 调度器把恢复看作有截止时间的多资源任务，而不是后台尽力搬运。
+% \begin{itemize}
+% \setlength{\itemsep}{0em}
+% \item 估计 SSD/3FS 读取、网络、DRAM、主机到显存搬运和 GPU 空闲预算。
+% \item 合并相邻冷层范围，并复用正在进行的恢复任务。
+% \item 按截止时间、收益和短请求隔离需求排序。
+% \end{itemize}
+% \end{block}
+% \end{column}
+
+% \begin{column}{0.48\textwidth}
+% \begin{block}{2. 准入决策}
+% 请求进入 vLLM 前必须得到确定结果，而不是带着冷层缺失继续执行。
+% \begin{itemize}
+% \setlength{\itemsep}{0em}
+% \item \texttt{准入}：所需范围已全部就绪。
+% \item \texttt{等待}：冷层范围可在首词延迟预算内恢复。
+% \item \texttt{降级/拒绝}：预算不足或正确性校验失败。
+% \end{itemize}
+% \end{block}
+% \end{column}
+% \end{columns}
+
+% \vspace{0.05em}
+
+% \begin{block}{3. 两阶段就绪屏障}
+% 第一阶段在预填充复用前检查历史 KV 是否就绪；第二阶段在解码前确认后续访问不会触发同步冷层缺失。若任一范围恢复失败、版本变化或超时，请求回到 KV 预检查重新规划，而不是进入执行后等待 I/O。
+% \end{block}
+
+% \vspace{0.02em}
+% \begin{beamercolorbox}[wd=\linewidth,sep=0.35em,rounded=true]{block body}
+% \textbf{\textcolor{AccentRed}{输出：}}
+% 准入后的 vLLM 只加载就绪 KV；系统以“同步冷层缺失次数为零”为协议约束，稳定避免冷层读写暴露到预填充/解码路径。
+% \end{beamercolorbox}
+
+% \end{frame}
 
 \begin{frame}[t]{System Overview: KV Anti-Caching 控制闭环}
 \scriptsize
@@ -370,40 +407,6 @@ admission 后的 vLLM 只消费 ready KV，系统目标是 \texttt{sync\_cold\_m
 sidecar/control plane 做准入、恢复、fallback 和预算；vLLM connector 只加载已经 ready 的 KV。
 \texttt{tier=3FS/SSD} 且 \texttt{ready=false} 的 KV 不能被 prefill reuse 或 decode 同步读取。
 \end{beamercolorbox}
-
-\end{frame}
-
-\begin{frame}[t]{Request Lifecycle: Anti-Caching 如何处理一个请求？}
-\footnotesize
-\vspace{-0.45em}
-
-\begin{block}{1. Commit：把成功请求的历史 KV 变成可复用状态}
-connector 保存 layer KV；control plane 记录 correctness key、token range、layout、checksum 和版本；
-后台策略决定哪些 ranges 后续可以 demote 到 cold tier。
-\end{block}
-
-\vspace{0.25em}
-
-\begin{block}{2. Demotion：把冷 KV 从执行层移动到容量层}
-当 HBM/DRAM 水位升高，系统选择低复用价值 ranges，打包成 cold object 写入 local NVMe 或 3FS。
-只有 checksum / manifest commit 成功后，才释放执行层副本并标记 \texttt{ready=false}。
-\end{block}
-
-\vspace{0.25em}
-
-\begin{block}{3. KVPrePass + Restore/Fallback：请求到来时先枚举 required KV}
-若全部 required ranges 已在 HBM/DRAM ready，则 ADMIT；
-若存在 cold ranges，则生成后台 restore task；
-若 correctness mismatch 或 missing，则 partial prefill / full fallback / delay / reject。
-\end{block}
-
-\vspace{0.25em}
-
-\begin{block}{4. Two-Phase Ready Barrier：恢复完成后才允许复用和生成}
-restore 将 selected ranges 标记为 DRAM ready；
-barrier 验证 prefill reuse 所需历史 KV ready、decode 所需 KV ready，且 \texttt{sync\_3fs\_miss\_total=0}；
-通过后再进入 vLLM prefill/decode。
-\end{block}
 
 \end{frame}
 
@@ -461,21 +464,7 @@ session append、shared prefix、agent trace、idle restore、mixed short/long�
 \Large
 \centering
 \textbf{
-我们的真正问题不是 ``如何设计一个 KV Anti-Caching 调度器''，
-而是现有推理服务无法让百万级历史 KV 在精确语义下同时满足容量、
-Prefill 复用 ready、Decode 执行 ready 和 TTFT SLA。
-}
-\end{beamercolorbox}
-
-\vspace{0.7em}
-
-\begin{beamercolorbox}[wd=\linewidth,sep=0.95em,rounded=true]{block body}
-\large
-\centering
-\textbf{
-KV Anti-Caching 的核心价值，是把冷层 KV miss 从 Prefill 重算和 Decode 同步等待中移出，
-通过 pre-pass、partial promotion 和 budgeted restore/fallback，
-让长上下文复用成为可控制的服务协议。
+多轮长上下文服务的关键不只是把 KV 存到更大的存储层级里，而是要将历史 KV 显式管理为可索引、可恢复、可准入控制的持久服务状态，并在请求进入 LLM 引擎前完成冷热判断与恢复调度，从而避免冷 KV 访问破坏在线推理延迟。
 }
 \end{beamercolorbox}
 
