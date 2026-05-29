@@ -19,12 +19,12 @@
 }
 \lstset{style=paperlisting}
 
-\newcommand{\system}{Persistent KV Anti-Caching\xspace}
+\newcommand{\system}{KVState\xspace}
 \newcommand{\kv}{KV\xspace}
 \newcommand{\ttft}{TTFT\xspace}
 \newcommand{\prepass}{PrePass\xspace}
 
-\title{Persistent KV Anti-Caching for Multi-Turn Long-Context LLM Serving}
+\title{KVState: Persistent State Management for Multi-Turn Long-Context LLM Serving}
 
 \author{Anonymous Authors}
 \affiliation{%
@@ -56,7 +56,7 @@
 \ccsdesc[300]{Computer systems organization~Distributed architectures}
 \ccsdesc[300]{Computing methodologies~Natural language processing}
 
-\keywords{KV cache, long-context serving, anti-caching, LLM serving, tiered storage}
+\keywords{KV cache, KV state management, long-context serving, LLM serving, tiered storage}
 
 \begin{abstract}
 Long-context LLM serving is increasingly used in enterprise RAG, code
@@ -68,15 +68,15 @@ when reusable historical KV exceeds GPU memory, a cold KV object is persistent
 but not execution-ready, and discovering it during prefill or decode can turn
 storage I/O into online tail latency.
 
-This paper introduces \system, a memory-primary KV management architecture for
-exact multi-turn long-context serving. The key idea is to treat cold historical
-KV as anti-cached state rather than as a conventional cache block. \system is
-developed with three designs: 1) a KV Evicted Index that records committed KV
-ranges across GPU-ready, CPU-ready, SSD-cold, fetching, loading, missing, and
-mismatched states; 2) a KV PrePass that enumerates required historical KV before
-a request enters the LLM engine and enforces a ready-barrier admission rule; and
-3) a packed cold-object layout that stores cold KV as offset-addressable
-sequential objects instead of many per-layer files.
+This paper introduces \system, a KV state-management architecture for exact
+multi-turn long-context serving. The key idea is to treat historical KV as
+serving state that transitions across execution and persistence tiers, rather
+than as a best-effort cache block. \system is developed with three designs: 1) a
+KV State Index that records committed KV ranges across GPU-ready, CPU-ready,
+SSD-cold, fetching, loading, missing, and mismatched states; 2) a KV State Probe,
+implemented as KV PrePass, that enumerates required historical KV before a
+request enters the LLM engine; and 3) an admission and ready-barrier protocol
+that controls when cold KV is allowed to become execution-ready state.
 
 We implement a vLLM-based prototype with a sidecar control plane and a custom
 KV connector. Preliminary experiments on Qwen2.5-14B-Instruct show that, when
@@ -134,18 +134,19 @@ abstraction is therefore not only a faster KV data path, but a control-plane
 state model that decides when cold historical KV is allowed to become execution
 state again.
 
-This paper revisits database anti-caching for persistent KV serving. In
-database anti-caching, main memory is the primary execution storage, cold tuples
-are evicted to disk, and an in-memory evicted table records where each tuple
-lives~\citep{debrabant2013anticaching}. When a transaction touches evicted data,
-the system enters a pre-pass phase to discover the needed disk blocks, fetches
-them asynchronously, and restarts the transaction after the data is available.
-The same principle fits historical KV reuse with one crucial change: an LLM
-engine cannot speculatively execute with missing historical KV because
-attention semantics would be incomplete. Therefore, the pre-pass must be a
-control-plane procedure before the request enters the GPU execution path.
+This paper borrows the control invariant of database anti-caching for persistent
+KV state management. In database anti-caching, main memory is the primary
+execution storage, cold tuples are evicted to disk, and an in-memory evicted
+table records where each tuple lives~\citep{debrabant2013anticaching}. When a
+transaction touches evicted data, the system enters a pre-pass phase to discover
+the needed disk blocks, fetches them asynchronously, and restarts the transaction
+after the data is available. The same principle fits historical KV reuse with
+one crucial change: an LLM engine cannot speculatively execute with missing
+historical KV because attention semantics would be incomplete. Therefore, the
+state probe must be a control-plane procedure before the request enters the GPU
+execution path.
 
-We propose \system, a system design that adapts anti-caching to exact KV reuse.
+We propose \system, a system design for exact persistent KV state management.
 The design is guided by four principles.
 
 \textbf{First, separate execution tiers from persistence tiers.} HBM and host
@@ -153,20 +154,20 @@ DRAM are the tiers from which KV can become execution-ready; SSD and 3FS are
 cold capacity tiers. A KV range in SSD is not a slow ready object. It is a
 non-ready object that must be restored, verified, and admitted.
 
-\textbf{Second, keep cold-state metadata in memory.} A KV Evicted Index records
+\textbf{Second, keep cold-state metadata in memory.} A KV State Index records
 committed historical KV ranges with correctness keys, token ranges, layer
 ranges, tier states, object identifiers, offsets, lengths, checksums, and
 in-flight restore or load identifiers. This lets the sidecar classify required
 historical KV without scanning storage or asking the GPU to discover misses.
 
-\textbf{Third, expose cold misses before admission.} KV PrePass tokenizes an
-incoming request, computes a correctness key, resolves session lineage or prefix
-candidates, enumerates required historical ranges, and classifies them as
-GPU-ready, CPU-ready, SSD-cold, fetching, loading, missing, or mismatched. The
-admission rule is explicit: requests with required cold KV are delayed,
-requeued, or fallbacked; they are not allowed to synchronously read SSD in the
-execution path. This transforms a cold miss from an opaque TTFT/ITL tail event
-into a schedulable restore operation.
+\textbf{Third, expose cold misses before admission.} A KV State Probe,
+implemented as KV PrePass, tokenizes an incoming request, computes a correctness
+key, resolves session lineage or prefix candidates, enumerates required
+historical ranges, and classifies them as GPU-ready, CPU-ready, SSD-cold,
+fetching, loading, missing, or mismatched. The admission rule is explicit:
+requests with required cold KV are delayed, requeued, or fallbacked; they are not
+allowed to synchronously read SSD in the execution path. This transforms a cold
+miss from an opaque TTFT/ITL tail event into a schedulable restore operation.
 
 \textbf{Fourth, use coarse physical objects with fine logical metadata.} A long
 prefix for a multi-layer transformer may otherwise become dozens or hundreds of
@@ -195,13 +196,14 @@ latency.
 
 In summary, this paper makes the following contributions:
 \begin{itemize}[leftmargin=*]
-  \item We formulate persistent historical KV serving as an anti-caching problem
-  rather than a conventional cache-hit problem.
-  \item We define a multi-tier KV state model and an in-memory KV Evicted Index
+  \item We formulate persistent historical KV serving as a state-management
+  problem rather than a conventional cache-hit problem.
+  \item We define a multi-tier KV state model and an in-memory KV State Index
   that separates GPU-ready, CPU-ready, SSD-cold, fetching, loading, missing,
   and mismatched states.
-  \item We design KV PrePass and a ready-barrier admission protocol that
-  prevents synchronous cold-tier misses from entering prefill or decode.
+  \item We design a KV State Probe, implemented as KV PrePass, and an
+  Admission/Ready Barrier protocol that prevents synchronous cold-tier misses
+  from entering prefill or decode.
   \item We introduce packed cold objects as the cold-tier data model for exact,
   verifiable, offset-addressable KV restoration.
   \item We report preliminary vLLM prototype evidence on synthetic scaling
@@ -213,8 +215,9 @@ In summary, this paper makes the following contributions:
 
 \subsection{Database Anti-Caching}
 
-\system is directly inspired by DeBrabant et al.'s anti-caching architecture
-for main-memory OLTP databases~\citep{debrabant2013anticaching}. Anti-caching
+\system is inspired by the control invariant in DeBrabant et al.'s anti-caching
+architecture for main-memory OLTP databases~\citep{debrabant2013anticaching}.
+Anti-caching
 reverses the traditional buffer-pool hierarchy: main memory is the primary
 storage, and cold tuples are moved to disk when memory is exhausted. The system
 maintains an in-memory Evicted Table that maps evicted tuples to disk blocks, a
@@ -230,9 +233,9 @@ setting. First, the evicted object is not a tuple but a model-, tokenizer-,
 position-, layout-, and prompt-specific KV state. A correctness key is therefore
 part of the object identity. Second, an LLM request cannot execute a meaningful
 ``trial'' decode with missing historical KV. Different from database
-anti-caching, \system moves the pre-pass into the serving control plane, where
-required KV is resolved from session lineage and prefix manifests before vLLM
-execution begins.
+anti-caching, \system moves the state probe into the serving control plane,
+where required KV is resolved from session lineage and prefix manifests before
+vLLM execution begins.
 
 \subsection{In-Engine KV Memory Management and Prefix Caching}
 
@@ -285,8 +288,8 @@ to manage KV across the serving system. It also treats SLO-aware scheduling and
 early rejection as first-class mechanisms~\citep{qin2024mooncake}. This is a
 strong signal that KV management has become a system-wide scheduling problem.
 
-\system can be viewed as a cold-state subsystem that could live inside such a
-KV-centric architecture. Its distinctive mechanism is the anti-cache transition:
+\system can be viewed as a persistent-state subsystem that could live inside such
+a KV-centric architecture. Its distinctive mechanism is the state transition:
 committed historical KV moves from execution tiers to a persistent cold tier,
 remains discoverable through an in-memory index, and returns to execution tiers
 through PrePass and admission. We do not replace disaggregated scheduling.
@@ -306,7 +309,7 @@ the fact that KV movement can dominate long-context serving latency.
 
 Our contribution should not be stated as ``we add SSD to KV cache'' or ``we
 manage GPU/DRAM/SSD tiers''; KVDrive already makes that framing too broad. The
-narrower claim is that multi-turn serving needs a persistent anti-cache
+narrower claim is that multi-turn serving needs persistent state-management
 semantics for historical KV. KVDrive primarily motivates how to move critical
 KV efficiently across tiers during long-context inference. \system asks when a
 cold historical KV object is allowed to become execution state again: it must
@@ -378,7 +381,7 @@ reuse.
 
 \system sits between the application gateway and the LLM engine, as a
 control-plane layer for historical KV state. The sidecar owns durable metadata,
-including session lineage, prefix manifests, correctness keys, the KV Evicted
+including session lineage, prefix manifests, correctness keys, the KV State
 Index, cold-object manifests, restore queues, and metrics. The vLLM connector
 owns controlled data movement into and out of the engine's KV representation.
 
@@ -439,12 +442,12 @@ sufficient to validate the control path. The design leaves room for smaller
 token extents and layer groups, which become important for partial promotion
 and parallel restore.
 
-\subsection{KV Evicted Index}
+\subsection{KV State Index}
 
-The KV Evicted Index is the in-memory metadata structure that makes
-anti-caching possible. It plays the same role as an evicted table in a
-database: the data itself may be cold, but the system must always know where it
-is and whether it can be used.
+The KV State Index is the in-memory metadata structure that makes persistent KV
+state management possible. It plays the same role as an evicted table in a
+database-inspired design: the data itself may be cold, but the system must
+always know where it is and whether it can be used.
 
 Each entry records:
 \begin{lstlisting}
@@ -472,7 +475,7 @@ Table~\ref{tab:states}.
 
 \begin{table*}[t]
   \centering
-  \caption{Multi-tier KV states used by the KV Evicted Index.}
+  \caption{Multi-tier KV states used by the KV State Index.}
   \label{tab:states}
   \begin{tabular}{lll}
     \toprule
@@ -496,9 +499,9 @@ load-readiness fields such as CPU-ready token count, expected H2D bytes, and
 estimated H2D load time; a production system should close the loop by writing
 connector load-completion events back into the index.
 
-\subsection{KV PrePass}
+\subsection{KV State Probe: KV PrePass}
 
-KV PrePass is the anti-cache probe for LLM serving. It runs before a request is
+KV PrePass is the state probe for LLM serving. It runs before a request is
 submitted to the engine. Its inputs are the request tokens, session or prefix
 candidates, and the desired correctness key. Its output is a reuse plan, a
 restore plan, and an admission decision.
@@ -508,7 +511,7 @@ PrePass performs:
   \item Tokenize the prompt and compute the correctness key.
   \item Resolve session lineage or shared-prefix candidates.
   \item Enumerate required historical ranges and the new suffix range.
-  \item Look up required ranges in the KV Evicted Index.
+  \item Look up required ranges in the KV State Index.
   \item Return classification sets and byte estimates.
   \item Enqueue restore for \texttt{SSD\_COLD} ranges, avoid duplicate enqueue
   for \texttt{FETCHING}, and block reuse for \texttt{MISSING} or
@@ -526,10 +529,11 @@ spike.
 
 \subsection{Admission and Ready Barrier}
 
-The ready barrier is the enforcement point for PrePass. It checks that every
-required range in the reuse plan is present, verified, and loadable before
-decode depends on it. In the prototype, the barrier is implemented through
-sidecar admission state and connector metadata. A cold probe first returns
+The ready barrier is the state-transition enforcement point for PrePass. It
+checks that every required range in the reuse plan is present, verified, and
+loadable before decode depends on it. In the prototype, the barrier is
+implemented through sidecar admission state and connector metadata. A cold probe
+first returns
 \texttt{DELAY} with \texttt{required\_kv\_not\_ready\_before\_decode}; after
 \texttt{/prefetch/advance} completes restore and checksum verification, a
 repeated admission returns \texttt{ADMIT}.
@@ -557,7 +561,7 @@ Early prototypes often store one KV tensor file per layer. That layout is
 manageable for tiny prompts, but it becomes a poor cold-tier format as context
 grows. A 32-layer or 48-layer model with many prefixes quickly creates many
 small files, fragmented reads, repeated metadata operations, and long restore
-tails. The anti-cache analogue is the difference between tuple identifiers and
+tails. The database analogue is the difference between tuple identifiers and
 disk blocks: the system needs fine-grained logical metadata but coarse-grained,
 sequential physical I/O.
 
@@ -617,7 +621,7 @@ interface. It estimates bytes and restore time, prevents duplicate restore for
 already-fetching ranges, exposes queue metrics, and records actual restore bytes
 and checksums. It does not yet implement a production-grade executor with queue
 depth tuning, pinned staging buffers, H2D overlap, or 3FS-specific semantics.
-These are engineering gaps in the data path, not changes to the anti-caching
+These are engineering gaps in the data path, not changes to the persistent KV
 state model.
 
 \subsection{vLLM Integration}
@@ -680,7 +684,7 @@ CPU-ready-to-GPU load time.
 The core research bet remains promising. KVDrive and Tutti show that KV data
 movement is a first-order bottleneck; LMCache and Mooncake show that KV must be
 managed outside a single GPU cache; LongMemEval-style workloads show that
-long-lived histories are real. \system adds a state-management semantics to this
+long-lived histories are real. \system adds state-management semantics to this
 design space: cold historical KV should be persistent, exact, indexed, restored
 before admission, and protected by a ready barrier. That is the system problem
 this project should continue to sharpen.
