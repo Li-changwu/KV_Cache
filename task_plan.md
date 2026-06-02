@@ -277,6 +277,13 @@
 - [x] 仿照 MoE serving PPT 逻辑，产出 KV Anti-Caching 项目叙事 slides
 - **状态：** complete
 
+### 研究阶段 R3：CacheBlend Gap Analysis 与选题重构
+- [x] 阅读本地 `CacheBlend.pdf`，提取其问题定义、系统假设、评测边界和 limitations
+- [x] 对比当前 Persistent KV Anti-Caching 主线，区分 CacheBlend 的 RAG chunk fusion 与本项目的 committed historical KV cold-resume
+- [x] 找出可 defend 的论文切入点、目标场景、方法轮廓和实验矩阵
+- [x] 输出研究备忘录 `docs/research/cacheblend_gap_analysis_for_persistent_kv.md`
+- **状态：** complete
+
 ## 关键问题
 1. 方案面向的第一落地平台是否以 vLLM 为主，还是先做独立模拟器/原型后再接入 vLLM？
 2. 1M tokens 场景的主目标是单请求超长上下文、批量长上下文服务，还是二者都要覆盖？

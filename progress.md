@@ -1774,3 +1774,23 @@
   - 把 Markdown 草稿整理为 LaTeX conference skeleton。
   - 补 Evaluation methodology、完整实验计划、limitations 和 threat-to-validity。
   - 后续实验补强 baseline 与 p95/p99 并发结果后，再把 preliminary results 升级为正式 Evaluation。
+
+## 会话：2026-05-29 CacheBlend Gap Analysis 与选题重构
+- **状态：** complete
+- 使用技能：
+  - `academic-research-suite`：采用 deep-research 的研究问题重构、synthesis 和 devil's advocate 视角。
+  - `brainstorming`：用于生成 2-3 个可行选题方向并收敛到推荐场景；本轮不进入实现设计文档流程。
+  - `context-engineering`：先读取 `AGENTS.md`、规划文件和现有论文草稿，避免偏离项目边界。
+  - `planning-with-files-zh`：恢复并更新 `task_plan.md`、`findings.md`、`progress.md`。
+  - `level2-research`：借用结构性瓶颈诊断视角，分析 CacheBlend 的假设与失效场景；本轮没有优化循环代码，因此未执行代码注入流程。
+- 执行的操作：
+  - 抽取并阅读 `/root/KV/CacheBlend.pdf` 正文。
+  - 核对 CacheBlend 的问题定义：RAG 多 chunk 非前缀 KV 融合与 selective recompute。
+  - 识别其系统边界：single-level KV store、LRU、layer-wise `torch.load`/`torch.save`、average delay estimator、未覆盖跨节点共享和新 serving engine。
+  - 对比本项目 Persistent KV Anti-Caching 主线，收敛出推荐场景：cold-resume multi-turn long-context serving。
+  - 写入研究备忘录 `docs/research/cacheblend_gap_analysis_for_persistent_kv.md`。
+- 创建/修改的文件：
+  - `/root/KV/docs/research/cacheblend_gap_analysis_for_persistent_kv.md`
+  - `/root/KV/task_plan.md`
+  - `/root/KV/findings.md`
+  - `/root/KV/progress.md`

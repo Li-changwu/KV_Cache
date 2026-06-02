@@ -510,6 +510,9 @@
 - 论文证据表 `docs/paper/evidence_table.md` 记录了当前可以支撑的结论：B5 online TTFT 在 synthetic 2K/8K/16K 中为 B0 的 `0.447x/0.295x/0.161x`；LongMemEval-S 单样本 2K/8K 为 `0.537x/0.297x`；但 restore-inclusive 在 2K/8K 仍高于 B0，不能声称请求到达后同步恢复满足 SLA。
 - 新增 `docs/paper/references.bib`，包含 Anti-Caching、PagedAttention、vLLM APC、LMCache、Mooncake、Tutti、KVDrive、CacheBlend 和 LongMemEval。当前引用以 arXiv/官方文档/PVLDB 信息为准，未声称 KVDrive 已被 SIGMOD 2026 收录。
 - 论文中明确保留当前缺口：尚无真实 3FS 集群性能、尚无强 baseline 全面对比、尚无 p95/p99 并发结果、尚未证明 admitted workload historical byte hit rate >=90%、尚未实现 1M 真实端到端服务。
+- 2026-05-29 CacheBlend gap analysis 结论：CacheBlend 的强项是 within-request RAG chunk fusion，通过 selective KV recompute 修复非前缀 chunk 缺失 cross-attention 的质量问题；它不是完整的 cross-request persistent historical KV anti-caching 系统。最值得继续推进的论文切入点是 **cold-resume multi-turn long-context serving**：长历史 KV 已经 committed 并冷却到 SSD/3FS，下一轮只追加短 suffix，请求进入 vLLM 前必须通过 PrePass 把 required historical KV 恢复、校验、标记 ready，否则 restore-inclusive TTFT 和 tail latency 会失控。
+- CacheBlend 对本项目而言的主要边界：它不定义 session lineage / committed KV range lifecycle；选择性重算是近似质量路径而不是 exact state reuse；KV store 偏单层、LRU、`torch.load`/`torch.save` 的简化设计；pipeline loading/recompute 不等价于 SLA admission；评测不覆盖 idle session resume、restart/cross-engine persistence、3FS/shared cold tier、restore storm、negative-control low-locality 和 p95/p99 deadline miss。
+- 推荐论文表述：CacheBlend 已经很好地解决了“同一请求内多个 cached RAG chunks 如何融合”；我们的工作要解决“跨请求冷却后的 historical KV 如何在下一次请求进入执行前变成 exact、verified、admission-ready serving state”。这要求 KV Evicted Index、PrePass、packed cold object、two-phase readiness 和 no synchronous cold miss guard。
 
 ---
 *每执行2次查看/浏览器/搜索操作后更新此文件。*
